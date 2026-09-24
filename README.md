@@ -7,7 +7,12 @@
 ```bash
 python3 -m release_workbench --help
 python3 -m release_workbench --version
+python3 -m release_workbench /Applications/Safari.app
 python3 -m unittest discover -s tests -v
 ```
 
-当前仅提供帮助与版本查询入口；无参数显示帮助，未知参数以非零状态退出。尚未实现应用包解析、签名与信任检查、依赖与架构核对、发布比较以及更新渠道检查，不会创建业务数据文件。
+应用包检查：传入一个 `.app` 包目录路径，将 JSON 结果输出到 stdout，字段含
+`bundle`、`bundleIdentifier`、`executable`、`frameworks`、`plugins`、`issues`；
+一次只接受一个位置参数。路径不存在、不是目录或不以 `.app` 结尾时，错误写入
+stderr 并以状态码 2 退出。尚未实现签名与信任检查、依赖与架构核对、发布比较
+以及更新渠道检查，不会创建业务数据文件。
