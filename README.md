@@ -7,7 +7,8 @@
 ```bash
 python3 -m release_workbench --help
 python3 -m release_workbench --version
+python3 -m release_workbench inspect /path/to/Demo.app
 python3 -m unittest discover -s tests -v
 ```
 
-当前仅提供帮助与版本查询入口；无参数显示帮助，未知参数以非零状态退出。尚未实现应用包解析、签名与信任检查、依赖与架构核对、发布比较以及更新渠道检查，不会创建业务数据文件。
+`inspect <app>` 读取应用包的 `Contents/Info.plist`（XML 或二进制 plist）与 `Contents/MacOS/`，把结构盘点结果作为 JSON 对象写到 stdout，不改动应用包内任何文件。JSON 顶层字段为 `bundle_path`、`bundle_identifier`、`bundle_name`、`short_version`、`executable`、`executables`、`issues`。参数错误、路径无效或包结构缺失时向 stderr 写一行并以状态码 2 退出。
