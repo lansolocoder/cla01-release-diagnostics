@@ -7,7 +7,24 @@
 ```bash
 python3 -m release_workbench --help
 python3 -m release_workbench --version
+python3 -m release_workbench inspect /path/to/App.app
 python3 -m unittest discover -s tests -v
 ```
 
-当前仅提供帮助与版本查询入口；无参数显示帮助，未知参数以非零状态退出。尚未实现应用包解析、签名与信任检查、依赖与架构核对、发布比较以及更新渠道检查，不会创建业务数据文件。
+## inspect 子命令
+
+```bash
+python3 -m release_workbench inspect <app>
+```
+
+读取 `<app>/Contents/Info.plist`（XML 或二进制 plist）与 `<app>/Contents/MacOS/`，向 stdout 输出一个 JSON 对象（退出码 0），不会改动应用包内的任何文件。顶层字段：
+
+- `bundle_path`：应用包绝对路径经 `os.path.realpath` 规范化后的字符串
+- `bundle_identifier`、`bundle_name`、`short_version`：分别取 `CFBundleIdentifier`、`CFBundleName`、`CFBundleShortVersionString`，键缺失或值非字符串时为 `null`
+- `executable`：取 `CFBundleExecutable` 指向的 `MacOS/` 下文件；未给出时为 `null`，文件不存在、不可执行或为目录时同样为 `null`，并在 `issues` 中记录 `{"code":"executable-missing","path": <文件名>}`
+- `executables`：`MacOS/` 下所有普通文件（不递归、不含子目录与符号链接）的相对文件名，按字典序排序
+- `issues`：问题列表，每项含 `code`、`path` 两个字符串字段
+
+参数数量不对、路径不存在或不是目录、缺少 `Contents/Info.plist`、plist 无法解析或顶层非字典、缺少 `Contents/MacOS` 或其不是目录时，向 stderr 写一行错误并以退出码 2 退出，stdout 为空。
+
+目前帮助、版本查询与应用包结构盘点之外的检查（签名与信任、依赖与架构、发布比较、更新渠道）尚未实现，不会创建业务数据文件。
