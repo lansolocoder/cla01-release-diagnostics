@@ -7,7 +7,8 @@
 ```bash
 python3 -m release_workbench --help
 python3 -m release_workbench --version
+python3 -m release_workbench inspect /path/to/Sample.app
 python3 -m unittest discover -s tests -v
 ```
 
-当前仅提供帮助与版本查询入口；无参数显示帮助，未知参数以非零状态退出。尚未实现应用包解析、签名与信任检查、依赖与架构核对、发布比较以及更新渠道检查，不会创建业务数据文件。
+`inspect` 接受一个 `.app` 包目录路径，将 JSON 报告输出到 stdout，字段为 `bundle`、`bundleIdentifier`、`executable`、`frameworks`、`plugins`、`issues`；路径无效时以退出码 2 失败且不输出 JSON。其余诊断能力（签名与信任检查、依赖与架构核对、发布比较、更新渠道检查）尚未实现，不会创建业务数据文件。
