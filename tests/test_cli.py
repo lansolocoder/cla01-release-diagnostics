@@ -1,5 +1,6 @@
 """Checks for the documented command-line entry point."""
 
+import hashlib
 import json
 from pathlib import Path
 import plistlib
@@ -457,6 +458,252 @@ class MachoInfoTests(unittest.TestCase):
 
     def test_extra_option_is_an_error(self) -> None:
         result = self.invoke("Example.app", "--bogus")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("--bogus", result.stderr)
+
+
+class ReleaseDiffTests(unittest.TestCase):
+    def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "release_workbench", "release-diff", *arguments],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def make_bundle(self, tmp: str, name: str) -> Path:
+        app = Path(tmp) / name
+        (app / "Contents").mkdir(parents=True)
+        return app
+
+    def sha256(self, data: bytes) -> str:
+        return hashlib.sha256(data).hexdigest()
+
+    def test_added_removed_changed_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_app = self.make_bundle(tmp, "Old.app")
+            new_app = self.make_bundle(tmp, "New.app")
+
+            (old_app / "Contents" / "MacOS").mkdir()
+            (old_app / "Contents" / "MacOS" / "App").write_bytes(b"same")
+            (old_app / "Contents" / "gone.txt").write_bytes(b"old-only")
+            (old_app / "Contents" / "data.bin").write_bytes(b"before")
+
+            (new_app / "Contents" / "MacOS").mkdir()
+            (new_app / "Contents" / "MacOS" / "App").write_bytes(b"same")
+            (new_app / "Contents" / "fresh.txt").write_bytes(b"new-only")
+            (new_app / "Contents" / "data.bin").write_bytes(b"after")
+
+            result = self.invoke(str(old_app), str(new_app))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(result.stdout.count("\n"), 1)
+        report = json.loads(result.stdout)
+        self.assertEqual(
+            report,
+            {
+                "files": [
+                    {
+                        "path": "Contents/MacOS/App",
+                        "change": "unchanged",
+                        "old_sha256": self.sha256(b"same"),
+                        "new_sha256": self.sha256(b"same"),
+                    },
+                    {
+                        "path": "Contents/data.bin",
+                        "change": "changed",
+                        "old_sha256": self.sha256(b"before"),
+                        "new_sha256": self.sha256(b"after"),
+                    },
+                    {
+                        "path": "Contents/fresh.txt",
+                        "change": "added",
+                        "old_sha256": None,
+                        "new_sha256": self.sha256(b"new-only"),
+                    },
+                    {
+                        "path": "Contents/gone.txt",
+                        "change": "removed",
+                        "old_sha256": self.sha256(b"old-only"),
+                        "new_sha256": None,
+                    },
+                ],
+                "summary": {"added": 1, "removed": 1, "changed": 1, "unchanged": 1},
+            },
+        )
+
+    def test_directories_on_one_side_are_changed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_app = self.make_bundle(tmp, "Old.app")
+            new_app = self.make_bundle(tmp, "New.app")
+
+            nested = old_app / "Contents" / "Frameworks" / "Deep"
+            nested.mkdir(parents=True)
+            (nested / "Lib").write_bytes(b"lib")
+            (new_app / "Contents" / "Frameworks").mkdir()
+            (new_app / "Contents" / "Frameworks" / "note.txt").write_bytes(b"note")
+            # File in the old bundle becomes a directory in the new bundle.
+            (old_app / "Contents" / "plug").write_bytes(b"file")
+            (new_app / "Contents" / "plug").mkdir()
+
+            result = self.invoke(str(old_app), str(new_app))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(
+            report["files"],
+            [
+                {
+                    "path": "Contents/Frameworks/Deep",
+                    "change": "changed",
+                    "old_sha256": None,
+                    "new_sha256": None,
+                },
+                {
+                    "path": "Contents/Frameworks/Deep/Lib",
+                    "change": "removed",
+                    "old_sha256": self.sha256(b"lib"),
+                    "new_sha256": None,
+                },
+                {
+                    "path": "Contents/Frameworks/note.txt",
+                    "change": "added",
+                    "old_sha256": None,
+                    "new_sha256": self.sha256(b"note"),
+                },
+                {
+                    "path": "Contents/plug",
+                    "change": "changed",
+                    "old_sha256": self.sha256(b"file"),
+                    "new_sha256": None,
+                },
+            ],
+        )
+        self.assertEqual(
+            report["summary"],
+            {"added": 1, "removed": 1, "changed": 2, "unchanged": 0},
+        )
+
+    def test_empty_bundles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_app = self.make_bundle(tmp, "Old.app")
+            new_app = self.make_bundle(tmp, "New.app")
+            result = self.invoke(str(old_app), str(new_app))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "files": [],
+                "summary": {"added": 0, "removed": 0, "changed": 0, "unchanged": 0},
+            },
+        )
+
+    def test_symlinks_are_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_app = self.make_bundle(tmp, "Old.app")
+            new_app = self.make_bundle(tmp, "New.app")
+            target = Path(tmp) / "outside"
+            target.write_bytes(b"target")
+            (old_app / "Contents" / "Link").symlink_to(target)
+            (new_app / "Contents" / "DirLink").symlink_to(
+                target.parent, target_is_directory=True
+            )
+            result = self.invoke(str(old_app), str(new_app))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "files": [],
+                "summary": {"added": 0, "removed": 0, "changed": 0, "unchanged": 0},
+            },
+        )
+
+    def test_nested_files_and_sorting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_app = self.make_bundle(tmp, "Old.app")
+            new_app = self.make_bundle(tmp, "New.app")
+            deep = new_app / "Contents" / "Resources" / "Sub"
+            deep.mkdir(parents=True)
+            (deep / "b.txt").write_bytes(b"b")
+            (deep / "a.txt").write_bytes(b"a")
+            result = self.invoke(str(old_app), str(new_app))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(
+            [entry["path"] for entry in report["files"]],
+            [
+                "Contents/Resources",
+                "Contents/Resources/Sub",
+                "Contents/Resources/Sub/a.txt",
+                "Contents/Resources/Sub/b.txt",
+            ],
+        )
+        self.assertEqual(
+            [entry["change"] for entry in report["files"]],
+            ["changed", "changed", "added", "added"],
+        )
+
+    def test_old_bundle_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            new_app = self.make_bundle(tmp, "New.app")
+            result = self.invoke("/nonexistent/Nope.app", str(new_app))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("/nonexistent/Nope.app", result.stderr)
+
+    def test_new_bundle_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_app = self.make_bundle(tmp, "Old.app")
+            bad = Path(tmp) / "File.app"
+            bad.write_text("not a bundle")
+            result = self.invoke(str(old_app), str(bad))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn(str(bad), result.stderr)
+
+    def test_name_not_app_suffix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_app = self.make_bundle(tmp, "Old.app")
+            bundle = Path(tmp) / "Example"
+            (bundle / "Contents").mkdir(parents=True)
+            result = self.invoke(str(old_app), str(bundle))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn(str(bundle), result.stderr)
+
+    def test_missing_contents_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_app = self.make_bundle(tmp, "Old.app")
+            bare = Path(tmp) / "NoContents.app"
+            bare.mkdir()
+            result = self.invoke(str(old_app), str(bare))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn(str(bare), result.stderr)
+
+    def test_unreadable_file_is_an_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_app = self.make_bundle(tmp, "Old.app")
+            new_app = self.make_bundle(tmp, "New.app")
+            locked = new_app / "Contents" / "locked.bin"
+            locked.write_bytes(b"secret")
+            locked.chmod(0)
+            try:
+                result = self.invoke(str(old_app), str(new_app))
+            finally:
+                locked.chmod(0o644)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn(str(locked), result.stderr)
+
+    def test_extra_option_is_an_error(self) -> None:
+        result = self.invoke("Old.app", "New.app", "--bogus")
         self.assertEqual(result.returncode, 2)
         self.assertEqual(result.stdout, "")
         self.assertIn("--bogus", result.stderr)

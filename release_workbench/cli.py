@@ -1,6 +1,7 @@
 """Command-line entry point."""
 
 import argparse
+import hashlib
 import json
 import os
 import plistlib
@@ -32,6 +33,10 @@ class AppInfoError(Exception):
 
 class MachoInfoError(Exception):
     """Diagnostic failure for a ``macho-info`` invocation."""
+
+
+class ReleaseDiffError(Exception):
+    """Diagnostic failure for a ``release-diff`` invocation."""
 
 
 def _collect_app_info(app_arg: str) -> dict:
@@ -198,6 +203,107 @@ def _collect_macho_info(app_arg: str) -> dict:
     return {"architectures": sorted(architectures), "binaries": binaries}
 
 
+def _validate_diff_bundle(app_arg: str) -> Path:
+    """Validate an ``.app`` bundle path and return its ``Contents`` directory."""
+    app_path = app_arg  # keep the user-supplied spelling in diagnostics
+    app = Path(app_arg)
+
+    if not app.exists():
+        raise ReleaseDiffError(f"{app_path}: path does not exist")
+    if not app.is_dir():
+        raise ReleaseDiffError(f"{app_path}: not a directory")
+    if not app.name.endswith(".app"):
+        raise ReleaseDiffError(f"{app_path}: bundle name must end with .app")
+
+    contents = app / "Contents"
+    if not contents.is_dir():
+        raise ReleaseDiffError(f"{app_path}: missing Contents directory")
+    return contents
+
+
+def _scan_bundle_entries(contents: Path) -> dict[str, str]:
+    """Map ``Contents/...`` relative paths to ``"file"`` or ``"dir"``.
+
+    Recurses through the whole tree without following symlinks; symlink
+    entries themselves are skipped.
+    """
+    entries: dict[str, str] = {}
+
+    def visit(directory: Path, prefix: str) -> None:
+        with os.scandir(directory) as scan:
+            for entry in scan:
+                if entry.is_symlink():
+                    continue
+                relative = prefix + "/" + entry.name
+                if entry.is_dir(follow_symlinks=False):
+                    entries[relative] = "dir"
+                    visit(Path(entry.path), relative)
+                elif entry.is_file(follow_symlinks=False):
+                    entries[relative] = "file"
+
+    visit(contents, "Contents")
+    return entries
+
+
+def _sha256_file(file_path: Path) -> str:
+    """Return the lowercase hex SHA-256 of a file's contents."""
+    digest = hashlib.sha256()
+    try:
+        with open(file_path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(65536), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise ReleaseDiffError(f"{file_path}: cannot read file ({exc})") from exc
+    return digest.hexdigest()
+
+
+def _collect_release_diff(old_arg: str, new_arg: str) -> dict:
+    """Compare two ``.app`` bundles file by file and return the report."""
+    old_contents = _validate_diff_bundle(old_arg)
+    new_contents = _validate_diff_bundle(new_arg)
+
+    old_entries = _scan_bundle_entries(old_contents)
+    new_entries = _scan_bundle_entries(new_contents)
+
+    files = []
+    for path in sorted(set(old_entries) | set(new_entries)):
+        old_kind = old_entries.get(path)
+        new_kind = new_entries.get(path)
+        if old_kind == "dir" and new_kind == "dir":
+            continue
+
+        old_sha256: str | None = None
+        new_sha256: str | None = None
+        if old_kind == "file":
+            old_sha256 = _sha256_file(old_contents.joinpath(*path.split("/")[1:]))
+        if new_kind == "file":
+            new_sha256 = _sha256_file(new_contents.joinpath(*path.split("/")[1:]))
+
+        if old_kind == "file" and new_kind == "file":
+            change = "unchanged" if old_sha256 == new_sha256 else "changed"
+        elif old_kind == "file" and new_kind is None:
+            change = "removed"
+        elif old_kind is None and new_kind == "file":
+            change = "added"
+        else:
+            # Directory present on only one side, or file vs directory.
+            change = "changed"
+
+        files.append(
+            {
+                "path": path,
+                "change": change,
+                "old_sha256": old_sha256,
+                "new_sha256": new_sha256,
+            }
+        )
+
+    summary = {"added": 0, "removed": 0, "changed": 0, "unchanged": 0}
+    for entry in files:
+        summary[entry["change"]] += 1
+    return {"files": files, "summary": summary}
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="release-workbench",
@@ -218,6 +324,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     macho_info_parser.add_argument("app", help="path to the .app bundle directory")
 
+    release_diff_parser = subparsers.add_parser(
+        "release-diff",
+        help="Compare two .app bundles file by file and emit a JSON report.",
+    )
+    release_diff_parser.add_argument(
+        "old_app", help="path to the older .app bundle directory"
+    )
+    release_diff_parser.add_argument(
+        "new_app", help="path to the newer .app bundle directory"
+    )
+
     args = parser.parse_args(argv)
 
     if args.command is None:
@@ -237,6 +354,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             report = _collect_macho_info(args.app)
         except MachoInfoError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps(report))
+        return 0
+
+    if args.command == "release-diff":
+        try:
+            report = _collect_release_diff(args.old_app, args.new_app)
+        except ReleaseDiffError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
         print(json.dumps(report))
