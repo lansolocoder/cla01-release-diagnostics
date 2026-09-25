@@ -8,6 +8,7 @@
 python3 -m release_workbench --help
 python3 -m release_workbench --version
 python3 -m release_workbench inspect /path/to/App.app
+python3 -m release_workbench diagnose /path/to/App.app
 python3 -m unittest discover -s tests -v
 ```
 
@@ -27,4 +28,24 @@ python3 -m release_workbench inspect <app>
 
 参数数量不对、路径不存在或不是目录、缺少 `Contents/Info.plist`、plist 无法解析或顶层非字典、缺少 `Contents/MacOS` 或其不是目录时，向 stderr 写一行错误并以退出码 2 退出，stdout 为空。
 
-目前帮助、版本查询与应用包结构盘点之外的检查（签名与信任、依赖与架构、发布比较、更新渠道）尚未实现，不会创建业务数据文件。
+## diagnose 子命令
+
+```bash
+python3 -m release_workbench diagnose <app>
+```
+
+复用 inspect 的应用包校验与 `Info.plist` 解析，在 macOS 上通过系统命令 `codesign`、`spctl` 读取签名与信任状态，向 stdout 输出一个 JSON 对象（退出码 0），不会改动应用包内的任何文件。顶层字段固定为：
+
+- `bundle_path`：应用包绝对路径经 `os.path.realpath` 规范化后的字符串
+- `identifier`、`team_identifier`：分别取签名标识（`codesign -dvvv` 的 `Identifier`）与团队标识（`TeamIdentifier`），无法读取、值非字符串或团队标识未设置（`not set`）时为 `null`
+- `signature_status`：签名状态，取 `signed`、`unsigned`、`damaged`、`unsupported` 之一
+  - `unsigned`：无签名标识或无签名密封清单（`Sealed Resources` 缺失或为 `none`）
+  - `signed`：`codesign --verify` 校验通过
+  - `damaged`：签名存在但校验失败（如密封文件被改动）
+  - `unsupported`：非 macOS 平台或 `codesign` 不可用，此时 `trusted` 为 `null`
+- `trusted`：`spctl --assess` 通过为 `true`，被拒绝为 `false`；非 macOS 平台或系统命令不可用时为 `null`
+- `issues`：问题列表，每项含 `code`、`path` 两个字符串字段；`code` 仅取 `signature-missing`、`signature-damaged`、`trust-denied`（分别对应 `unsigned`、`damaged`、`trusted` 为 `false`），`path` 取签名文件相对路径（`Contents/_CodeSignature/CodeResources`），同一文件名至多一条
+
+三种问题情况仍输出 JSON 并保持退出码 0。参数数量不对、路径不存在或不是目录、缺少 `Contents/Info.plist`、plist 无法解析或顶层非字典、缺少 `Contents/MacOS` 或其不是目录时，向 stderr 写一行错误并以退出码 2 退出，stdout 为空且不生成或修改任何文件。
+
+目前帮助、版本查询、应用包结构盘点以及签名与信任检查之外的检查（依赖与架构、发布比较、更新渠道）尚未实现，不会创建业务数据文件。

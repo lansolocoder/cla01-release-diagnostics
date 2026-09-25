@@ -1,5 +1,8 @@
 """Checks for the documented command-line entry point."""
 
+import contextlib
+import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -9,9 +12,13 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from release_workbench import cli as rw_cli  # noqa: E402
 
 EXPECTED_TOP_LEVEL_KEYS = {
     "bundle_path",
@@ -22,6 +29,17 @@ EXPECTED_TOP_LEVEL_KEYS = {
     "executables",
     "issues",
 }
+
+DIAGNOSE_KEYS = {
+    "bundle_path",
+    "identifier",
+    "team_identifier",
+    "signature_status",
+    "trusted",
+    "issues",
+}
+
+CODE_RESOURCES = os.path.join("Contents", "_CodeSignature", "CodeResources")
 
 
 class CommandLineTests(unittest.TestCase):
@@ -43,6 +61,7 @@ class CommandLineTests(unittest.TestCase):
                 self.assertIn("--version", result.stdout)
                 if arguments == ("--help",):
                     self.assertIn("inspect", result.stdout)
+                    self.assertIn("diagnose", result.stdout)
                 self.assertEqual(result.stderr, "")
 
     def test_version(self) -> None:
@@ -300,6 +319,292 @@ class InspectTests(unittest.TestCase):
         macos.rmdir()
         macos.write_bytes(b"x")
         self.assert_failure(self.invoke(str(app)))
+
+
+class DiagnoseTests(unittest.TestCase):
+    def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "release_workbench", "diagnose", *arguments],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def call_direct(self, app: str) -> tuple[int, str]:
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = rw_cli.diagnose_bundle(app)
+        return code, stdout.getvalue()
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+
+    def create_app(self, name: str = "Demo.app") -> tuple[Path, Path, Path]:
+        app = self.tmp / name
+        macos = app / "Contents" / "MacOS"
+        macos.mkdir(parents=True)
+        return app, app / "Contents" / "Info.plist", macos
+
+    def write_info(self, plist_path: Path) -> None:
+        with open(plist_path, "wb") as plist_file:
+            plistlib.dump(
+                {
+                    "CFBundleIdentifier": "com.example.Demo",
+                    "CFBundleExecutable": "Demo",
+                },
+                plist_file,
+            )
+
+    def make_executable(self, macos: Path) -> None:
+        executable = macos / "Demo"
+        executable.write_bytes(b"#!/bin/bash\necho demo\n")
+        os.chmod(executable, 0o755)
+
+    def build_app(self, name: str = "Demo.app") -> Path:
+        app, info_plist, macos = self.create_app(name)
+        self.write_info(info_plist)
+        self.make_executable(macos)
+        return app
+
+    def sign_ad_hoc(self, app: Path) -> None:
+        subprocess.run(
+            ["codesign", "-s", "-", "--force", str(app)],
+            capture_output=True,
+            check=True,
+        )
+
+    def assert_failure(self, result: subprocess.CompletedProcess[str]) -> None:
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr.count("\n"), 1)
+        self.assertTrue(result.stderr.endswith("\n"))
+
+    def fingerprint(self, app: Path) -> dict[str, tuple[int, bytes]]:
+        snapshot: dict[str, tuple[int, bytes]] = {}
+        for root, dirs, files in os.walk(app):
+            for name in files:
+                path = os.path.join(root, name)
+                st = os.lstat(path)
+                with open(path, "rb") as handle:
+                    digest = hashlib.sha256(handle.read()).digest()
+                snapshot[os.path.relpath(path, app)] = (
+                    stat.S_IMODE(st.st_mode),
+                    digest,
+                )
+        return snapshot
+
+    # --- macOS signature states -----------------------------------------
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS only")
+    def test_signed_bundle_is_signed_and_untrusted_ad_hoc(self) -> None:
+        app = self.build_app()
+        self.sign_ad_hoc(app)
+        before = self.fingerprint(app)
+
+        result = self.invoke(str(app))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        report = json.loads(result.stdout)
+        self.assertEqual(set(report.keys()), DIAGNOSE_KEYS)
+        self.assertEqual(report["bundle_path"], os.path.realpath(app))
+        self.assertEqual(report["identifier"], "com.example.Demo")
+        self.assertIsNone(report["team_identifier"])
+        self.assertEqual(report["signature_status"], "signed")
+        # An ad-hoc signature verifies but is not trusted by Gatekeeper.
+        self.assertFalse(report["trusted"])
+        self.assertEqual(
+            report["issues"],
+            [{"code": "trust-denied", "path": CODE_RESOURCES}],
+        )
+        self.assertEqual(self.fingerprint(app), before)
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS only")
+    def test_unsigned_bundle(self) -> None:
+        app = self.build_app()
+
+        result = self.invoke(str(app))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertIsNone(report["identifier"])
+        self.assertIsNone(report["team_identifier"])
+        self.assertEqual(report["signature_status"], "unsigned")
+        self.assertFalse(report["trusted"])
+        self.assertEqual(
+            report["issues"],
+            [{"code": "signature-missing", "path": CODE_RESOURCES}],
+        )
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS only")
+    def test_signed_bundle_without_sealed_manifest_is_unsigned(self) -> None:
+        app = self.build_app()
+        self.sign_ad_hoc(app)
+        os.remove(app / "Contents" / "_CodeSignature" / "CodeResources")
+
+        result = self.invoke(str(app))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["signature_status"], "unsigned")
+        self.assertFalse(report["trusted"])
+        self.assertEqual(
+            report["issues"],
+            [{"code": "signature-missing", "path": CODE_RESOURCES}],
+        )
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS only")
+    def test_damaged_signature_is_detected(self) -> None:
+        app = self.build_app()
+        self.sign_ad_hoc(app)
+        # Tamper with the sealed executable after signing.
+        with open(app / "Contents" / "MacOS" / "Demo", "ab") as handle:
+            handle.write(b"# tampered\n")
+        before = self.fingerprint(app)
+
+        result = self.invoke(str(app))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["identifier"], "com.example.Demo")
+        self.assertEqual(report["signature_status"], "damaged")
+        self.assertFalse(report["trusted"])
+        self.assertEqual(
+            report["issues"],
+            [{"code": "signature-damaged", "path": CODE_RESOURCES}],
+        )
+        # Diagnosis must not repair or otherwise touch the bundle.
+        self.assertEqual(self.fingerprint(app), before)
+
+    def test_non_macos_platform_degrades_to_unsupported(self) -> None:
+        app = self.build_app()
+        before = self.fingerprint(app)
+
+        with mock.patch.object(rw_cli.platform, "system", return_value="Linux"):
+            code, output = self.call_direct(str(app))
+        self.assertEqual(code, 0)
+        report = json.loads(output)
+        self.assertEqual(set(report.keys()), DIAGNOSE_KEYS)
+        self.assertEqual(report["bundle_path"], os.path.realpath(app))
+        self.assertIsNone(report["identifier"])
+        self.assertIsNone(report["team_identifier"])
+        self.assertEqual(report["signature_status"], "unsupported")
+        self.assertIsNone(report["trusted"])
+        self.assertEqual(report["issues"], [])
+        self.assertEqual(self.fingerprint(app), before)
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS only")
+    def test_missing_system_command_degrades_to_unsupported(self) -> None:
+        app = self.build_app()
+
+        with mock.patch.object(rw_cli.shutil, "which", return_value=None):
+            code, output = self.call_direct(str(app))
+        self.assertEqual(code, 0)
+        report = json.loads(output)
+        self.assertEqual(report["signature_status"], "unsupported")
+        self.assertIsNone(report["trusted"])
+        self.assertEqual(report["issues"], [])
+
+    def test_signed_and_trusted_developer_id_via_mocked_commands(self) -> None:
+        app = self.build_app()
+        display = (
+            "Executable=/x/Contents/MacOS/Demo\n"
+            "Identifier=com.example.Demo\n"
+            "Authority=Developer ID Application: Example Corp (ABC123DE45)\n"
+            "TeamIdentifier=ABC123DE45\n"
+            "Sealed Resources version=2 rules=13 files=42\n"
+        )
+
+        def fake_run(*args: str) -> subprocess.CompletedProcess[str]:
+            args_list = list(args)
+            if args_list[:2] == ["codesign", "-dvvv"]:
+                return subprocess.CompletedProcess(args_list, 0, "", display)
+            if args_list[:2] == ["codesign", "--verify"]:
+                return subprocess.CompletedProcess(args_list, 0, "", "")
+            if args_list[0] == "spctl":
+                return subprocess.CompletedProcess(
+                    args_list, 0, f"{app}: accepted\n", ""
+                )
+            raise AssertionError(args)
+
+        with (
+            mock.patch.object(rw_cli.platform, "system", return_value="Darwin"),
+            mock.patch.object(
+                rw_cli.shutil, "which", return_value="/usr/bin/codesign"
+            ),
+            mock.patch.object(rw_cli, "_run_command", side_effect=fake_run),
+        ):
+            code, output = self.call_direct(str(app))
+
+        self.assertEqual(code, 0)
+        report = json.loads(output)
+        self.assertEqual(report["identifier"], "com.example.Demo")
+        self.assertEqual(report["team_identifier"], "ABC123DE45")
+        self.assertEqual(report["signature_status"], "signed")
+        self.assertTrue(report["trusted"])
+        self.assertEqual(report["issues"], [])
+
+    # --- failure paths (exit code 2) ------------------------------------
+
+    def test_wrong_argument_count(self) -> None:
+        self.assert_failure(self.invoke())
+        app = self.build_app()
+        self.assert_failure(self.invoke(str(app), "extra"))
+
+    def test_option_like_tokens_are_arguments_not_flags(self) -> None:
+        self.assert_failure(self.invoke("--bogus"))
+        self.assert_failure(self.invoke("--help"))
+        self.assert_failure(self.invoke("-x"))
+
+    def test_path_does_not_exist(self) -> None:
+        self.assert_failure(self.invoke(str(self.tmp / "Missing.app")))
+
+    def test_path_is_not_a_directory(self) -> None:
+        plain_file = self.tmp / "NotAnApp"
+        plain_file.write_text("x")
+        self.assert_failure(self.invoke(str(plain_file)))
+
+    def test_missing_info_plist(self) -> None:
+        app, _info_plist, _macos = self.create_app()
+        self.assert_failure(self.invoke(str(app)))
+
+    def test_unparseable_info_plist(self) -> None:
+        app, info_plist, _macos = self.create_app()
+        info_plist.write_bytes(b"this is not a plist")
+        self.assert_failure(self.invoke(str(app)))
+
+    def test_info_plist_top_level_not_dictionary(self) -> None:
+        app, info_plist, _macos = self.create_app()
+        with open(info_plist, "wb") as plist_file:
+            plistlib.dump(["not", "a", "dict"], plist_file)
+        self.assert_failure(self.invoke(str(app)))
+
+    def test_missing_macos_directory(self) -> None:
+        app, info_plist, macos = self.create_app()
+        self.write_info(info_plist)
+        macos.rmdir()
+        self.assert_failure(self.invoke(str(app)))
+
+    def test_macos_not_a_directory(self) -> None:
+        app, info_plist, macos = self.create_app()
+        self.write_info(info_plist)
+        macos.rmdir()
+        macos.write_bytes(b"x")
+        self.assert_failure(self.invoke(str(app)))
+
+    def test_failure_does_not_create_files(self) -> None:
+        app, info_plist, macos = self.create_app()
+        self.write_info(info_plist)
+        macos.rmdir()
+        before = {
+            str(p.relative_to(app))
+            for p in app.rglob("*")
+        }
+        self.assert_failure(self.invoke(str(app)))
+        after = {
+            str(p.relative_to(app))
+            for p in app.rglob("*")
+        }
+        self.assertEqual(before, after)
 
 
 if __name__ == "__main__":
