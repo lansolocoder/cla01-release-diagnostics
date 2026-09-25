@@ -4,6 +4,7 @@ import argparse
 from collections.abc import Sequence
 
 from . import __version__
+from .check_deps import check_deps
 from .inspect_bundle import inspect_app
 from .verify_signature import verify_signature
 
@@ -34,11 +35,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=None,
         help="expected team identifier; mismatches are reported",
     )
+    deps_parser = subparsers.add_parser(
+        "check-deps",
+        help="check dylib dependencies and architecture slices in a .app bundle",
+        description="Scan regular files below Contents of a .app bundle, parse load "
+        "commands of every recognized 64-bit Mach-O (including fat slices), and print "
+        "a JSON dependency report.",
+    )
+    deps_parser.add_argument("app_path", metavar="APP", help="path to the .app bundle directory")
+    deps_parser.add_argument(
+        "--require-arch",
+        metavar="NAME",
+        default=None,
+        help="required architecture (arm64 or x86_64); missing slices are reported",
+    )
 
     args = parser.parse_args(argv)
     if args.command == "inspect":
         return inspect_app(args.app_path)
     if args.command == "verify-signature":
         return verify_signature(args.app_path, team_id=args.team_id)
+    if args.command == "check-deps":
+        return check_deps(args.app_path, require_arch=args.require_arch)
     parser.print_help()
     return 0
