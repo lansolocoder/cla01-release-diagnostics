@@ -9,6 +9,7 @@ python3 -m release_workbench --help
 python3 -m release_workbench --version
 python3 -m release_workbench app-info /path/to/Example.app
 python3 -m release_workbench macho-info /path/to/Example.app
+python3 -m release_workbench release-diff /path/to/Old.app /path/to/New.app
 python3 -m unittest discover -s tests -v
 ```
 
@@ -30,4 +31,12 @@ python3 -m unittest discover -s tests -v
 
 `architectures` 为架构标签去重升序（32 位小端 `i386`、32 位大端 `ppc`、64 位小端 `x86_64`、64 位大端 `ppc64`）；`binaries` 按相对包根、`/` 分隔的 `path` 升序，同文件 dylib 去重升序。未发现 Mach-O 时两数组为空，仍成功退出（0）。Mach-O 头截断、dylib 命令畸形（cmdsize 小于命令头、越出文件、偏移非法）或命令版本非 0 时，诊断信息写入 stderr（含出错文件路径），stdout 为空，退出码 2；包级校验（路径不存在、非目录、名称不以 `.app` 结尾、缺少 `Contents`）与 `app-info` 一致，`Info.plist` 缺失或非法不影响本命令。
 
-尚未实现签名与信任检查、依赖与架构核对、发布比较以及更新渠道检查，不会创建或修改业务数据文件。
+`release-diff` 递归比较两个应用包 `Contents/` 下的全部子项（含目录本身，符号链接跳过且不跟随），逐文件计算 SHA-256，向 stdout 输出单行 JSON：
+
+```json
+{"files": [{"path": "Contents/MacOS/App", "change": "added", "old_sha256": null, "new_sha256": "3a4c2e0f..."}, {"path": "Contents/Resources", "change": "changed", "old_sha256": null, "new_sha256": null}], "summary": {"added": 1, "removed": 0, "changed": 1, "unchanged": 0}}
+```
+
+`path` 为相对包根、`/` 分隔，按字典序升序；`change` 取值：`added`（仅新包存在且为文件）、`removed`（仅旧包存在且为文件）、`changed`（两边都是文件但 SHA-256 不同，或仅一侧存在目录、一侧是目录另一侧是文件）、`unchanged`（两边都是文件且哈希相同）；两侧同为目录的路径不出现在结果中。`old_sha256`、`new_sha256` 仅在对应侧为文件时给出 64 位小写十六进制 SHA-256，缺失或为目录时为 `null`。`summary` 四个计数为 `files` 中各 `change` 的条数；两包都没有可比较子项时 `files` 为空数组、计数全为 0，仍成功退出（0）。包级校验对两个包分别执行且与其他命令一致（路径不存在、非目录、名称不以 `.app` 结尾、缺少 `Contents`），比较中文件读取失败同样诊断写 stderr（含出错路径）、stdout 为空、退出码 2；不产生任何输出文件。未知参数以非零状态退出。
+
+尚未实现签名与信任检查、依赖与架构核对以及更新渠道检查，不会创建或修改业务数据文件。

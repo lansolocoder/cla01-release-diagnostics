@@ -1,5 +1,6 @@
 """Checks for the documented command-line entry point."""
 
+import hashlib
 import json
 from pathlib import Path
 import plistlib
@@ -197,6 +198,249 @@ class AppInfoTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertEqual(result.stdout, "")
         self.assertIn("--bogus", result.stderr)
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+class ReleaseDiffTests(unittest.TestCase):
+    def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "release_workbench",
+                "release-diff",
+                *arguments,
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def make_bundle(self, tmp: str, name: str) -> Path:
+        app = Path(tmp) / name
+        (app / "Contents").mkdir(parents=True)
+        return app
+
+    def write(self, app: Path, relative: str, data: bytes) -> None:
+        target = app / "Contents" / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+
+    def test_all_change_kinds_sorted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self.make_bundle(tmp, "Old.app")
+            new = self.make_bundle(tmp, "New.app")
+            self.write(old, "MacOS/App", b"same")
+            self.write(new, "MacOS/App", b"same")
+            self.write(old, "Resources/old.txt", b"old")
+            self.write(new, "Resources/new.txt", b"new")
+            self.write(old, "Info.plist", b"v1")
+            self.write(new, "Info.plist", b"v2")
+            (new / "Contents" / "Frameworks").mkdir()
+            result = self.invoke(str(old), str(new))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(result.stdout.count("\n"), 1)
+        report = json.loads(result.stdout)
+        self.assertEqual(
+            report,
+            {
+                "files": [
+                    {
+                        "path": "Contents/Frameworks",
+                        "change": "changed",
+                        "old_sha256": None,
+                        "new_sha256": None,
+                    },
+                    {
+                        "path": "Contents/Info.plist",
+                        "change": "changed",
+                        "old_sha256": _sha256(b"v1"),
+                        "new_sha256": _sha256(b"v2"),
+                    },
+                    {
+                        "path": "Contents/MacOS/App",
+                        "change": "unchanged",
+                        "old_sha256": _sha256(b"same"),
+                        "new_sha256": _sha256(b"same"),
+                    },
+                    {
+                        "path": "Contents/Resources/new.txt",
+                        "change": "added",
+                        "old_sha256": None,
+                        "new_sha256": _sha256(b"new"),
+                    },
+                    {
+                        "path": "Contents/Resources/old.txt",
+                        "change": "removed",
+                        "old_sha256": _sha256(b"old"),
+                        "new_sha256": None,
+                    },
+                ],
+                "summary": {
+                    "added": 1,
+                    "removed": 1,
+                    "changed": 2,
+                    "unchanged": 1,
+                },
+            },
+        )
+
+    def test_recurses_and_skips_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self.make_bundle(tmp, "Old.app")
+            new = self.make_bundle(tmp, "New.app")
+            self.write(old, "Resources/Deep/a", b"a")
+            self.write(new, "Resources/Deep/a", b"a")
+            outside = Path(tmp) / "outside"
+            outside.write_bytes(b"outside")
+            (new / "Contents" / "Resources" / "link").symlink_to(outside)
+            (old / "Contents" / "Resources" / "dirlink").symlink_to(
+                outside.parent, target_is_directory=True
+            )
+            result = self.invoke(str(old), str(new))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(
+            report,
+            {
+                "files": [
+                    {
+                        "path": "Contents/Resources/Deep/a",
+                        "change": "unchanged",
+                        "old_sha256": _sha256(b"a"),
+                        "new_sha256": _sha256(b"a"),
+                    },
+                ],
+                "summary": {
+                    "added": 0,
+                    "removed": 0,
+                    "changed": 0,
+                    "unchanged": 1,
+                },
+            },
+        )
+
+    def test_directory_on_one_side_and_type_clash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self.make_bundle(tmp, "Old.app")
+            new = self.make_bundle(tmp, "New.app")
+            (old / "Contents" / "onlydir").mkdir()
+            self.write(old, "clash", b"file-side")
+            (new / "Contents" / "clash").mkdir()
+            result = self.invoke(str(old), str(new))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        entries = {entry["path"]: entry for entry in report["files"]}
+        self.assertEqual(entries["Contents/clash"]["change"], "changed")
+        self.assertEqual(entries["Contents/clash"]["old_sha256"], _sha256(b"file-side"))
+        self.assertIsNone(entries["Contents/clash"]["new_sha256"])
+        dir_entry = entries["Contents/onlydir"]
+        self.assertEqual(dir_entry["change"], "changed")
+        self.assertIsNone(dir_entry["old_sha256"])
+        self.assertIsNone(dir_entry["new_sha256"])
+        self.assertEqual(
+            report["summary"],
+            {"added": 0, "removed": 0, "changed": 2, "unchanged": 0},
+        )
+
+    def test_empty_bundles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self.make_bundle(tmp, "Old.app")
+            new = self.make_bundle(tmp, "New.app")
+            result = self.invoke(str(old), str(new))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "files": [],
+                "summary": {
+                    "added": 0,
+                    "removed": 0,
+                    "changed": 0,
+                    "unchanged": 0,
+                },
+            },
+        )
+
+    def test_unreadable_file_is_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self.make_bundle(tmp, "Old.app")
+            new = self.make_bundle(tmp, "New.app")
+            self.write(old, "secret", b"x")
+            self.write(new, "secret", b"x")
+            secret = old / "Contents" / "secret"
+            secret.chmod(0o000)
+            try:
+                result = self.invoke(str(old), str(new))
+            finally:
+                secret.chmod(0o644)
+
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertEqual(result.stdout, "")
+        self.assertIn(str(secret), result.stderr)
+
+    def assert_bundle_error(self, old: str | Path, new: str | Path) -> None:
+        result = self.invoke(str(old), str(new))
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertEqual(result.stdout, "")
+
+    def test_old_path_does_not_exist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            new = self.make_bundle(tmp, "New.app")
+            result = self.invoke("/nonexistent/Nope.app", str(new))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("/nonexistent/Nope.app", result.stderr)
+
+    def test_new_not_a_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self.make_bundle(tmp, "Old.app")
+            new = Path(tmp) / "File.app"
+            new.write_text("not a bundle")
+            result = self.invoke(str(old), str(new))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn(str(new), result.stderr)
+
+    def test_old_name_not_app_suffix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old = Path(tmp) / "Example"
+            (old / "Contents").mkdir(parents=True)
+            new = self.make_bundle(tmp, "New.app")
+            result = self.invoke(str(old), str(new))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn(str(old), result.stderr)
+
+    def test_new_missing_contents(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self.make_bundle(tmp, "Old.app")
+            new = Path(tmp) / "NoContents.app"
+            new.mkdir()
+            result = self.invoke(str(old), str(new))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn(str(new), result.stderr)
+
+    def test_extra_option_is_an_error(self) -> None:
+        result = self.invoke("Old.app", "New.app", "--bogus")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("--bogus", result.stderr)
+
+    def test_missing_positional_is_an_error(self) -> None:
+        result = self.invoke("Old.app")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
 
 
 MAGIC_32_BE = b"\xfe\xed\xfa\xce"
