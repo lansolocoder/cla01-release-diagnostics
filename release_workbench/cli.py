@@ -198,6 +198,43 @@ def _collect_macho_info(app_arg: str) -> dict:
     return {"architectures": sorted(architectures), "binaries": binaries}
 
 
+def _collect_app_snapshot(app_arg: str) -> dict:
+    """Collect both the ``app-info`` and ``macho-info`` reports for a bundle."""
+    info = _collect_app_info(app_arg)
+    macho = _collect_macho_info(app_arg)
+    return {
+        "bundle_id": info["bundle_id"],
+        "executable": info["executable"],
+        "components": set(info["components"]),
+        "architectures": set(macho["architectures"]),
+        "binaries": {
+            entry["path"]: set(entry["dylibs"]) for entry in macho["binaries"]
+        },
+    }
+
+
+def _diff_app_snapshots(old: dict, new: dict) -> dict:
+    """Compare two bundle snapshots and return the JSON-serialisable report."""
+    dylib_changes = []
+    for path in sorted(old["binaries"].keys() & new["binaries"].keys()):
+        added = sorted(new["binaries"][path] - old["binaries"][path])
+        removed = sorted(old["binaries"][path] - new["binaries"][path])
+        if added or removed:
+            dylib_changes.append({"path": path, "added": added, "removed": removed})
+
+    return {
+        "added_components": sorted(new["components"] - old["components"]),
+        "removed_components": sorted(old["components"] - new["components"]),
+        "bundle_id_changed": old["bundle_id"] != new["bundle_id"],
+        "executable_changed": old["executable"] != new["executable"],
+        "added_architectures": sorted(new["architectures"] - old["architectures"]),
+        "removed_architectures": sorted(old["architectures"] - new["architectures"]),
+        "added_binaries": sorted(new["binaries"].keys() - old["binaries"].keys()),
+        "removed_binaries": sorted(old["binaries"].keys() - new["binaries"].keys()),
+        "dylib_changes": dylib_changes,
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="release-workbench",
@@ -217,6 +254,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="List Mach-O binaries in a .app bundle and their linked dylibs.",
     )
     macho_info_parser.add_argument("app", help="path to the .app bundle directory")
+
+    diff_apps_parser = subparsers.add_parser(
+        "diff-apps",
+        help="Compare two .app bundles (old then new) and emit a JSON diff.",
+    )
+    diff_apps_parser.add_argument("old_app", help="path to the old .app bundle")
+    diff_apps_parser.add_argument("new_app", help="path to the new .app bundle")
 
     args = parser.parse_args(argv)
 
@@ -240,6 +284,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 2
         print(json.dumps(report))
+        return 0
+
+    if args.command == "diff-apps":
+        try:
+            old_snapshot = _collect_app_snapshot(args.old_app)
+            new_snapshot = _collect_app_snapshot(args.new_app)
+        except (AppInfoError, MachoInfoError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps(_diff_app_snapshots(old_snapshot, new_snapshot)))
         return 0
 
     return 0

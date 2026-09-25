@@ -462,5 +462,211 @@ class MachoInfoTests(unittest.TestCase):
         self.assertIn("--bogus", result.stderr)
 
 
+class DiffAppsTests(unittest.TestCase):
+    def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "release_workbench", "diff-apps", *arguments],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def make_bundle(self, tmp: str, name: str) -> Path:
+        app = Path(tmp) / name
+        (app / "Contents" / "MacOS").mkdir(parents=True)
+        (app / "Contents" / "Resources").mkdir()
+        return app
+
+    def test_identical_bundles_have_no_diff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_bundle(tmp, "Same.app")
+            contents = app / "Contents"
+            _write_plist(
+                contents / "Info.plist",
+                {"CFBundleIdentifier": "com.example.App", "CFBundleExecutable": "App"},
+            )
+            (contents / "MacOS" / "App").write_bytes(
+                _macho(MAGIC_64_LE, [_dylib_command(b"/usr/lib/libSystem.B.dylib")])
+            )
+            result = self.invoke(str(app), str(app))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(result.stdout.count("\n"), 1)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "added_components": [],
+                "removed_components": [],
+                "bundle_id_changed": False,
+                "executable_changed": False,
+                "added_architectures": [],
+                "removed_architectures": [],
+                "added_binaries": [],
+                "removed_binaries": [],
+                "dylib_changes": [],
+            },
+        )
+
+    def test_full_diff(self) -> None:
+        with tempfile.TemporaryDirectory() as old_tmp, tempfile.TemporaryDirectory() as new_tmp:
+            old = self.make_bundle(old_tmp, "App.app")
+            (old / "Contents" / "OldDir").mkdir()
+            _write_plist(
+                old / "Contents" / "Info.plist",
+                {"CFBundleIdentifier": "com.example.App", "CFBundleExecutable": "Main"},
+            )
+            (old / "Contents" / "MacOS" / "Main").write_bytes(
+                _macho(
+                    MAGIC_64_LE,
+                    [_dylib_command(b"/usr/lib/libSystem.B.dylib")],
+                )
+            )
+            (old / "Contents" / "Resources" / "OldHelper").write_bytes(
+                _macho(MAGIC_32_BE, [])
+            )
+
+            new = self.make_bundle(new_tmp, "App.app")
+            (new / "Contents" / "Frameworks").mkdir()
+            _write_plist(
+                new / "Contents" / "Info.plist",
+                {"CFBundleIdentifier": "com.example.App2", "CFBundleExecutable": "Main2"},
+            )
+            (new / "Contents" / "MacOS" / "Main").write_bytes(
+                _macho(
+                    MAGIC_64_LE,
+                    [
+                        _dylib_command(b"/usr/lib/libSystem.B.dylib"),
+                        _dylib_command(b"/usr/lib/libz.1.dylib"),
+                    ],
+                )
+            )
+            (new / "Contents" / "Resources" / "NewHelper").write_bytes(
+                _macho(MAGIC_32_LE, [])
+            )
+            result = self.invoke(str(old), str(new))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "added_components": ["Contents/Frameworks"],
+                "removed_components": ["Contents/OldDir"],
+                "bundle_id_changed": True,
+                "executable_changed": True,
+                "added_architectures": ["i386"],
+                "removed_architectures": ["ppc"],
+                "added_binaries": ["Contents/Resources/NewHelper"],
+                "removed_binaries": ["Contents/Resources/OldHelper"],
+                "dylib_changes": [
+                    {
+                        "path": "Contents/MacOS/Main",
+                        "added": ["/usr/lib/libz.1.dylib"],
+                        "removed": [],
+                    }
+                ],
+            },
+        )
+
+    def test_dylib_added_and_removed_sorted(self) -> None:
+        with tempfile.TemporaryDirectory() as old_tmp, tempfile.TemporaryDirectory() as new_tmp:
+            old = self.make_bundle(old_tmp, "App.app")
+            new = self.make_bundle(new_tmp, "App.app")
+            for app, names in (
+                (old, [b"/usr/lib/libOld.dylib", b"/usr/lib/libSame.dylib"]),
+                (new, [b"/usr/lib/libNew.dylib", b"/usr/lib/libSame.dylib"]),
+            ):
+                (app / "Contents" / "MacOS" / "App").write_bytes(
+                    _macho(MAGIC_64_LE, [_dylib_command(name) for name in names])
+                )
+            result = self.invoke(str(old), str(new))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(
+            report["dylib_changes"],
+            [
+                {
+                    "path": "Contents/MacOS/App",
+                    "added": ["/usr/lib/libNew.dylib"],
+                    "removed": ["/usr/lib/libOld.dylib"],
+                }
+            ],
+        )
+
+    def test_missing_info_plist_compared_as_null(self) -> None:
+        with tempfile.TemporaryDirectory() as old_tmp, tempfile.TemporaryDirectory() as new_tmp:
+            old = self.make_bundle(old_tmp, "App.app")
+            new = self.make_bundle(new_tmp, "App.app")
+            _write_plist(
+                new / "Contents" / "Info.plist",
+                {"CFBundleIdentifier": "com.example.App", "CFBundleExecutable": "App"},
+            )
+            both_missing_result = self.invoke(str(old), str(old))
+            changed_result = self.invoke(str(old), str(new))
+
+        self.assertEqual(both_missing_result.returncode, 0, both_missing_result.stderr)
+        both_report = json.loads(both_missing_result.stdout)
+        self.assertFalse(both_report["bundle_id_changed"])
+        self.assertFalse(both_report["executable_changed"])
+
+        self.assertEqual(changed_result.returncode, 0, changed_result.stderr)
+        changed_report = json.loads(changed_result.stdout)
+        self.assertTrue(changed_report["bundle_id_changed"])
+        self.assertTrue(changed_report["executable_changed"])
+
+    def assert_diff_error(self, old: str, new: str, *paths: str) -> None:
+        result = self.invoke(old, new)
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertEqual(result.stdout, "")
+        for path in paths:
+            self.assertIn(path, result.stderr)
+
+    def test_old_bundle_validated_first(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            valid = self.make_bundle(tmp, "Valid.app")
+            self.assert_diff_error(
+                "/nonexistent/Old.app", str(valid), "/nonexistent/Old.app"
+            )
+            self.assert_diff_error(
+                str(valid), "/nonexistent/New.app", "/nonexistent/New.app"
+            )
+            self.assert_diff_error(
+                "/nonexistent/First.app",
+                "/nonexistent/Second.app",
+                "/nonexistent/First.app",
+            )
+
+    def test_not_a_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_file = Path(tmp) / "Old.app"
+            old_file.write_text("not a bundle")
+            valid = self.make_bundle(tmp, "Valid.app")
+            self.assert_diff_error(str(old_file), str(valid), str(old_file))
+
+    def test_invalid_info_plist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            valid = self.make_bundle(tmp, "Valid.app")
+            broken = self.make_bundle(tmp, "Broken.app")
+            (broken / "Contents" / "Info.plist").write_text("<<< not a plist >>>")
+            plist_path = str(broken / "Contents" / "Info.plist")
+            self.assert_diff_error(str(valid), str(broken), plist_path)
+
+    def test_malformed_macho(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            valid = self.make_bundle(tmp, "Valid.app")
+            broken = self.make_bundle(tmp, "Broken.app")
+            bad_binary = broken / "Contents" / "MacOS" / "Bad"
+            bad_binary.write_bytes(MAGIC_64_LE + b"\x00" * 4)
+            self.assert_diff_error(str(valid), str(broken), str(bad_binary))
+
+    def test_missing_positional_argument(self) -> None:
+        result = self.invoke("Only.app")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+
+
 if __name__ == "__main__":
     unittest.main()
