@@ -4,11 +4,15 @@ import argparse
 import json
 import os
 import plistlib
+import shutil
+import subprocess
 import sys
 from collections.abc import Sequence
 from xml.parsers.expat import ExpatError
 
 from . import __version__
+
+SIGNATURE_RELATIVE_PATH = "Contents/_CodeSignature/CodeResources"
 
 
 def _fail(message: str) -> int:
@@ -17,30 +21,49 @@ def _fail(message: str) -> int:
     return 2
 
 
-def inspect_bundle(app: str) -> int:
-    """Inspect a built .app bundle and print a JSON summary to stdout."""
+def _read_bundle_info(app: str, command: str) -> tuple[dict | None, int]:
+    """Validate the bundle layout and parse its Info.plist.
+
+    Returns ``(info, 0)`` on success; otherwise ``(None, exit_code)`` after
+    writing a one-line error to stderr.
+    """
     if not os.path.exists(app):
-        return _fail(f"inspect: path does not exist: {app}")
+        return None, _fail(f"{command}: path does not exist: {app}")
     if not os.path.isdir(app):
-        return _fail(f"inspect: not a directory: {app}")
+        return None, _fail(f"{command}: not a directory: {app}")
 
     contents = os.path.join(app, "Contents")
     plist_path = os.path.join(contents, "Info.plist")
     macos_dir = os.path.join(contents, "MacOS")
 
     if not os.path.isfile(plist_path):
-        return _fail(f"inspect: missing Info.plist: {plist_path}")
+        return None, _fail(f"{command}: missing Info.plist: {plist_path}")
 
     try:
         with open(plist_path, "rb") as plist_file:
             info = plistlib.load(plist_file)
     except (plistlib.InvalidFileException, ValueError, OSError, ExpatError):
-        return _fail(f"inspect: cannot parse Info.plist: {plist_path}")
+        return None, _fail(f"{command}: cannot parse Info.plist: {plist_path}")
     if not isinstance(info, dict):
-        return _fail(f"inspect: Info.plist top level is not a dictionary: {plist_path}")
+        return None, _fail(
+            f"{command}: Info.plist top level is not a dictionary: {plist_path}"
+        )
 
     if not os.path.isdir(macos_dir):
-        return _fail(f"inspect: missing Contents/MacOS directory: {macos_dir}")
+        return None, _fail(
+            f"{command}: missing Contents/MacOS directory: {macos_dir}"
+        )
+
+    return info, 0
+
+
+def inspect_bundle(app: str) -> int:
+    """Inspect a built .app bundle and print a JSON summary to stdout."""
+    info, status = _read_bundle_info(app, "inspect")
+    if info is None:
+        return status
+
+    macos_dir = os.path.join(app, "Contents", "MacOS")
 
     def string_value(key: str) -> str | None:
         value = info.get(key)
@@ -81,18 +104,118 @@ def inspect_bundle(app: str) -> int:
     return 0
 
 
+def _run_quiet(arguments: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        arguments,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _assess_signature(
+    app: str, codesign: str, spctl: str
+) -> tuple[str, str | None, str | None, bool | None, list[dict[str, str]]]:
+    """Read signature and trust state with codesign/spctl (read-only)."""
+    query = _run_quiet([codesign, "-dv", "--verbose=4", app])
+    values: dict[str, str] = {}
+    for line in query.stderr.splitlines():
+        for key in ("Identifier", "TeamIdentifier"):
+            prefix = key + "="
+            if line.startswith(prefix):
+                values[key] = line[len(prefix):]
+    identifier = values.get("Identifier")
+    team_identifier = values.get("TeamIdentifier")
+
+    manifest = os.path.join(app, SIGNATURE_RELATIVE_PATH)
+    if identifier is None or not os.path.isfile(manifest):
+        return (
+            "unsigned",
+            identifier,
+            team_identifier,
+            None,
+            [{"code": "signature-missing", "path": SIGNATURE_RELATIVE_PATH}],
+        )
+
+    verify = _run_quiet([codesign, "--verify", "--verbose=4", app])
+    if verify.returncode != 0:
+        return (
+            "damaged",
+            identifier,
+            team_identifier,
+            None,
+            [{"code": "signature-damaged", "path": SIGNATURE_RELATIVE_PATH}],
+        )
+
+    assess = _run_quiet([spctl, "--assess", "--verbose=4", app])
+    trusted = assess.returncode == 0
+    issues: list[dict[str, str]] = []
+    if not trusted:
+        issues.append({"code": "trust-denied", "path": SIGNATURE_RELATIVE_PATH})
+    return "signed", identifier, team_identifier, trusted, issues
+
+
+def diagnose_bundle(app: str) -> int:
+    """Diagnose signature and trust state of a .app bundle as JSON."""
+    info, status = _read_bundle_info(app, "diagnose")
+    if info is None:
+        return status
+
+    identifier: str | None = None
+    team_identifier: str | None = None
+    signature_status = "unsupported"
+    trusted: bool | None = None
+    issues: list[dict[str, str]] = []
+
+    if sys.platform == "darwin":
+        codesign = shutil.which("codesign")
+        spctl = shutil.which("spctl")
+        if codesign is not None and spctl is not None:
+            try:
+                (
+                    signature_status,
+                    identifier,
+                    team_identifier,
+                    trusted,
+                    issues,
+                ) = _assess_signature(app, codesign, spctl)
+            except OSError:
+                # The system commands vanished between lookup and exec.
+                signature_status = "unsupported"
+                identifier = None
+                team_identifier = None
+                trusted = None
+                issues = []
+
+    report = {
+        "bundle_path": os.path.realpath(app),
+        "identifier": identifier,
+        "team_identifier": team_identifier,
+        "signature_status": signature_status,
+        "trusted": trusted,
+        "issues": issues,
+    }
+    json.dump(report, sys.stdout, ensure_ascii=False)
+    sys.stdout.write("\n")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
     arguments = list(argv)
 
-    # Dispatch inspect before argparse so option-like paths are treated as the
-    # single argument they are and every usage error stays a one-line stderr
-    # message with exit code 2.
-    if arguments[:1] == ["inspect"]:
-        if len(arguments) != 2:
-            return _fail("inspect: expected exactly one argument: <app>")
-        return inspect_bundle(arguments[1])
+    # Dispatch inspect/diagnose before argparse so option-like paths are
+    # treated as the single argument they are and every usage error stays a
+    # one-line stderr message with exit code 2.
+    for command, handler in (
+        ("inspect", inspect_bundle),
+        ("diagnose", diagnose_bundle),
+    ):
+        if arguments[:1] == [command]:
+            if len(arguments) != 2:
+                return _fail(f"{command}: expected exactly one argument: <app>")
+            return handler(arguments[1])
 
     parser = argparse.ArgumentParser(
         prog="release-workbench",
@@ -106,6 +229,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="inspect a built .app bundle and print its structure as JSON",
     )
     inspect_parser.add_argument("app", metavar="<app>")
+
+    diagnose_parser = subparsers.add_parser(
+        "diagnose",
+        help="diagnose signature and trust state of a .app bundle as JSON",
+    )
+    diagnose_parser.add_argument("app", metavar="<app>")
 
     parser.parse_args(arguments)
     parser.print_help()

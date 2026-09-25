@@ -1,5 +1,7 @@
 """Checks for the documented command-line entry point."""
 
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -9,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -43,6 +46,7 @@ class CommandLineTests(unittest.TestCase):
                 self.assertIn("--version", result.stdout)
                 if arguments == ("--help",):
                     self.assertIn("inspect", result.stdout)
+                    self.assertIn("diagnose", result.stdout)
                 self.assertEqual(result.stderr, "")
 
     def test_version(self) -> None:
@@ -262,6 +266,274 @@ class InspectTests(unittest.TestCase):
         # A single option-like token is treated as the path (which does not
         # exist); multiple tokens are an argument-count error. Either way the
         # result is one stderr line, empty stdout, exit code 2.
+        self.assert_failure(self.invoke("--bogus"))
+        self.assert_failure(self.invoke("--help"))
+        self.assert_failure(self.invoke("-x"))
+
+    def test_path_does_not_exist(self) -> None:
+        self.assert_failure(self.invoke(str(self.tmp / "Missing.app")))
+
+    def test_path_is_not_a_directory(self) -> None:
+        plain_file = self.tmp / "NotAnApp"
+        plain_file.write_text("x")
+        self.assert_failure(self.invoke(str(plain_file)))
+
+    def test_missing_info_plist(self) -> None:
+        app, _info_plist, _macos = self.create_app()
+        self.assert_failure(self.invoke(str(app)))
+
+    def test_unparseable_info_plist(self) -> None:
+        app, info_plist, _macos = self.create_app()
+        info_plist.write_bytes(b"this is not a plist")
+        self.assert_failure(self.invoke(str(app)))
+
+    def test_info_plist_top_level_not_dictionary(self) -> None:
+        app, info_plist, _macos = self.create_app()
+        self.write_info(info_plist, ["not", "a", "dict"])
+        self.assert_failure(self.invoke(str(app)))
+
+    def test_missing_macos_directory(self) -> None:
+        app, info_plist, macos = self.create_app()
+        self.write_info(info_plist, {"CFBundleExecutable": "Demo"})
+        macos.rmdir()
+        self.assert_failure(self.invoke(str(app)))
+
+    def test_macos_not_a_directory(self) -> None:
+        app, info_plist, macos = self.create_app()
+        self.write_info(info_plist, {"CFBundleExecutable": "Demo"})
+        macos.rmdir()
+        macos.write_bytes(b"x")
+        self.assert_failure(self.invoke(str(app)))
+
+
+FAKE_CODESIGN = """#!/bin/sh
+mode="${FAKE_CODESIGN_MODE:-signed}"
+for arg in "$@"; do
+  if [ "$arg" = "--verify" ]; then
+    if [ "$mode" = "damaged" ]; then
+      echo "code signature invalid" >&2
+      exit 1
+    fi
+    exit 0
+  fi
+done
+if [ "$mode" = "unsigned" ]; then
+  echo "code object is not signed at all" >&2
+  exit 1
+fi
+printf '%s\\n' \\
+  "Executable=/tmp/Demo.app/Contents/MacOS/Demo" \\
+  "Identifier=com.example.Demo" \\
+  "Format=app bundle with Mach-O thin (arm64)" \\
+  "TeamIdentifier=ABCDE12345" >&2
+exit 0
+"""
+
+FAKE_SPCTL = """#!/bin/sh
+if [ "${FAKE_SPCTL_MODE:-accept}" = "deny" ]; then
+  echo "rejected" >&2
+  exit 1
+fi
+exit 0
+"""
+
+DIAGNOSE_TOP_LEVEL_KEYS = {
+    "bundle_path",
+    "identifier",
+    "team_identifier",
+    "signature_status",
+    "trusted",
+    "issues",
+}
+
+SIGNATURE_RELATIVE_PATH = "Contents/_CodeSignature/CodeResources"
+
+
+class DiagnoseTests(unittest.TestCase):
+    def invoke(
+        self, *arguments: str, env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "release_workbench", "diagnose", *arguments],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+        )
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+        self.bin_dir = self.tmp / "bin"
+        self.bin_dir.mkdir()
+        for name, content in (
+            ("codesign", FAKE_CODESIGN),
+            ("spctl", FAKE_SPCTL),
+        ):
+            tool = self.bin_dir / name
+            tool.write_text(content)
+            os.chmod(tool, 0o755)
+
+    def make_env(self, **modes: str) -> dict[str, str]:
+        env = os.environ.copy()
+        env["PATH"] = str(self.bin_dir) + os.pathsep + env.get("PATH", "")
+        env.update(modes)
+        return env
+
+    def create_app(self, name: str = "Demo.app") -> tuple[Path, Path, Path]:
+        app = self.tmp / name
+        macos = app / "Contents" / "MacOS"
+        macos.mkdir(parents=True)
+        return app, app / "Contents" / "Info.plist", macos
+
+    def write_info(self, plist_path: Path, content: object) -> None:
+        with open(plist_path, "wb") as plist_file:
+            plistlib.dump(content, plist_file)
+
+    def create_valid_app(self, name: str = "Demo.app") -> Path:
+        app, info_plist, macos = self.create_app(name)
+        self.write_info(
+            info_plist,
+            {
+                "CFBundleIdentifier": "com.example.Demo",
+                "CFBundleExecutable": "Demo",
+                "UnrelatedKey": "ignored",
+            },
+        )
+        (macos / "Demo").write_bytes(b"binary\n")
+        return app
+
+    def add_signature_manifest(self, app: Path, content: bytes = b"manifest\n") -> Path:
+        manifest = app / SIGNATURE_RELATIVE_PATH
+        manifest.parent.mkdir(parents=True)
+        manifest.write_bytes(content)
+        return manifest
+
+    def diagnose(self, app: Path, **modes: str) -> dict:
+        result = self.invoke(str(app), env=self.make_env(**modes))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        report = json.loads(result.stdout)
+        self.assertEqual(set(report.keys()), DIAGNOSE_TOP_LEVEL_KEYS)
+        self.assertEqual(report["bundle_path"], os.path.realpath(app))
+        return report
+
+    def assert_failure(self, result: subprocess.CompletedProcess[str]) -> None:
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr.count("\n"), 1)
+        self.assertTrue(result.stderr.endswith("\n"))
+
+    def test_signed_and_trusted(self) -> None:
+        app = self.create_valid_app()
+        self.add_signature_manifest(app)
+
+        report = self.diagnose(app)
+        self.assertEqual(report["signature_status"], "signed")
+        self.assertEqual(report["identifier"], "com.example.Demo")
+        self.assertEqual(report["team_identifier"], "ABCDE12345")
+        self.assertIs(report["trusted"], True)
+        self.assertEqual(report["issues"], [])
+
+    def test_signed_but_trust_denied(self) -> None:
+        app = self.create_valid_app()
+        self.add_signature_manifest(app)
+
+        report = self.diagnose(app, FAKE_SPCTL_MODE="deny")
+        self.assertEqual(report["signature_status"], "signed")
+        self.assertIs(report["trusted"], False)
+        self.assertEqual(
+            report["issues"],
+            [{"code": "trust-denied", "path": SIGNATURE_RELATIVE_PATH}],
+        )
+
+    def test_unsigned_without_identifier_or_manifest(self) -> None:
+        app = self.create_valid_app()
+
+        report = self.diagnose(app, FAKE_CODESIGN_MODE="unsigned")
+        self.assertEqual(report["signature_status"], "unsigned")
+        self.assertIsNone(report["identifier"])
+        self.assertIsNone(report["team_identifier"])
+        self.assertIsNone(report["trusted"])
+        self.assertEqual(
+            report["issues"],
+            [{"code": "signature-missing", "path": SIGNATURE_RELATIVE_PATH}],
+        )
+
+    def test_unsigned_when_manifest_missing(self) -> None:
+        # codesign reports an identifier but the sealed manifest is absent.
+        app = self.create_valid_app()
+
+        report = self.diagnose(app)
+        self.assertEqual(report["signature_status"], "unsigned")
+        self.assertEqual(report["identifier"], "com.example.Demo")
+        self.assertIsNone(report["trusted"])
+        self.assertEqual(
+            report["issues"],
+            [{"code": "signature-missing", "path": SIGNATURE_RELATIVE_PATH}],
+        )
+
+    def test_damaged_signature(self) -> None:
+        app = self.create_valid_app()
+        manifest = self.add_signature_manifest(app)
+        before = manifest.read_bytes()
+
+        report = self.diagnose(app, FAKE_CODESIGN_MODE="damaged")
+        self.assertEqual(report["signature_status"], "damaged")
+        self.assertEqual(report["identifier"], "com.example.Demo")
+        self.assertEqual(report["team_identifier"], "ABCDE12345")
+        self.assertIsNone(report["trusted"])
+        self.assertEqual(
+            report["issues"],
+            [{"code": "signature-damaged", "path": SIGNATURE_RELATIVE_PATH}],
+        )
+        # The bundle must not be modified.
+        self.assertEqual(manifest.read_bytes(), before)
+
+    def test_system_commands_unavailable_is_unsupported(self) -> None:
+        app = self.create_valid_app()
+        self.add_signature_manifest(app)
+        env = os.environ.copy()
+        env["PATH"] = str(self.tmp / "empty-bin")
+
+        result = self.invoke(str(app), env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(set(report.keys()), DIAGNOSE_TOP_LEVEL_KEYS)
+        self.assertEqual(report["signature_status"], "unsupported")
+        self.assertIsNone(report["identifier"])
+        self.assertIsNone(report["team_identifier"])
+        self.assertIsNone(report["trusted"])
+        self.assertEqual(report["issues"], [])
+
+    def test_non_macos_platform_is_unsupported(self) -> None:
+        app = self.create_valid_app()
+        self.add_signature_manifest(app)
+
+        from release_workbench import cli
+
+        stdout = io.StringIO()
+        with mock.patch.object(sys, "platform", "linux"):
+            with contextlib.redirect_stdout(stdout):
+                code = cli.main(["diagnose", str(app)])
+        self.assertEqual(code, 0)
+        report = json.loads(stdout.getvalue())
+        self.assertEqual(set(report.keys()), DIAGNOSE_TOP_LEVEL_KEYS)
+        self.assertEqual(report["bundle_path"], os.path.realpath(app))
+        self.assertEqual(report["signature_status"], "unsupported")
+        self.assertIsNone(report["identifier"])
+        self.assertIsNone(report["team_identifier"])
+        self.assertIsNone(report["trusted"])
+        self.assertEqual(report["issues"], [])
+
+    def test_wrong_argument_count(self) -> None:
+        self.assert_failure(self.invoke())
+        app = self.create_valid_app()
+        self.assert_failure(self.invoke(str(app), "extra"))
+
+    def test_option_like_tokens_are_arguments_not_flags(self) -> None:
         self.assert_failure(self.invoke("--bogus"))
         self.assert_failure(self.invoke("--help"))
         self.assert_failure(self.invoke("-x"))
