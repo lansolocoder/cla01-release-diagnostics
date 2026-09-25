@@ -9,6 +9,7 @@ python3 -m release_workbench --help
 python3 -m release_workbench --version
 python3 -m release_workbench app-info /path/to/Example.app
 python3 -m release_workbench macho-info /path/to/Example.app
+python3 -m release_workbench diff-apps /path/to/Old.app /path/to/New.app
 python3 -m unittest discover -s tests -v
 ```
 
@@ -30,4 +31,12 @@ python3 -m unittest discover -s tests -v
 
 `architectures` 为架构标签去重升序（32 位小端 `i386`、32 位大端 `ppc`、64 位小端 `x86_64`、64 位大端 `ppc64`）；`binaries` 按相对包根、`/` 分隔的 `path` 升序，同文件 dylib 去重升序。未发现 Mach-O 时两数组为空，仍成功退出（0）。Mach-O 头截断、dylib 命令畸形（cmdsize 小于命令头、越出文件、偏移非法）或命令版本非 0 时，诊断信息写入 stderr（含出错文件路径），stdout 为空，退出码 2；包级校验（路径不存在、非目录、名称不以 `.app` 结尾、缺少 `Contents`）与 `app-info` 一致，`Info.plist` 缺失或非法不影响本命令。
 
-尚未实现签名与信任检查、依赖与架构核对、发布比较以及更新渠道检查，不会创建或修改业务数据文件。
+`diff-apps` 接收旧包、新包两个位置参数（按此顺序校验），分别按 `app-info`、`macho-info` 的公开规则计算两侧结果后比较，向 stdout 输出单行 JSON：
+
+```json
+{"added_components": [], "removed_components": [], "bundle_id_changed": false, "executable_changed": false, "added_architectures": [], "removed_architectures": [], "added_binaries": [], "removed_binaries": [], "dylib_changes": [{"path": "Contents/MacOS/App", "added": ["/usr/lib/libz.1.dylib"], "removed": []}]}
+```
+
+`added_components`/`removed_components`、`added_architectures`/`removed_architectures`、`added_binaries`/`removed_binaries` 分别为两侧 components、architectures、binary 相对路径的集合差（新减旧、旧减新），升序；`dylib_changes` 只含两侧都存在且 dylib 集合不同的 binary，按 `path` 升序，其 `added`/`removed` 为该 binary 两侧 dylibs 的集合差。`bundle_id_changed`、`executable_changed` 表示两侧 `CFBundleIdentifier`、`CFBundleExecutable` 是否不等（`Info.plist` 缺失或值非字符串时按 `null` 比较，`null` 与字符串不等也算改变）。两侧完全一致时列表全空、布尔均为 `false`。校验先旧包后新包：任一包路径不存在、非目录、名称不以 `.app` 结尾、缺少 `Contents`，或任一侧 `Info.plist` 非法、包内 Mach-O 畸形时，诊断信息写入 stderr（含出错路径），stdout 为空，退出码 2，不输出部分比较结果。成功时退出码 0、stderr 为空、stdout 恰一行 JSON。
+
+尚未实现签名与信任检查、依赖与架构核对以及更新渠道检查，不会创建或修改业务数据文件。

@@ -198,6 +198,49 @@ def _collect_macho_info(app_arg: str) -> dict:
     return {"architectures": sorted(architectures), "binaries": binaries}
 
 
+def _collect_apps_diff(old_arg: str, new_arg: str) -> dict:
+    """Compare two ``.app`` bundles using the app-info/macho-info rules."""
+    # Validate and inspect the old bundle fully before touching the new one.
+    old_info = _collect_app_info(old_arg)
+    old_macho = _collect_macho_info(old_arg)
+    new_info = _collect_app_info(new_arg)
+    new_macho = _collect_macho_info(new_arg)
+
+    old_components = set(old_info["components"])
+    new_components = set(new_info["components"])
+
+    old_archs = set(old_macho["architectures"])
+    new_archs = set(new_macho["architectures"])
+
+    old_dylibs = {
+        entry["path"]: set(entry["dylibs"]) for entry in old_macho["binaries"]
+    }
+    new_dylibs = {
+        entry["path"]: set(entry["dylibs"]) for entry in new_macho["binaries"]
+    }
+    old_paths = set(old_dylibs)
+    new_paths = set(new_dylibs)
+
+    dylib_changes = []
+    for path in sorted(old_paths & new_paths):
+        added = sorted(new_dylibs[path] - old_dylibs[path])
+        removed = sorted(old_dylibs[path] - new_dylibs[path])
+        if added or removed:
+            dylib_changes.append({"path": path, "added": added, "removed": removed})
+
+    return {
+        "added_components": sorted(new_components - old_components),
+        "removed_components": sorted(old_components - new_components),
+        "bundle_id_changed": old_info["bundle_id"] != new_info["bundle_id"],
+        "executable_changed": old_info["executable"] != new_info["executable"],
+        "added_architectures": sorted(new_archs - old_archs),
+        "removed_architectures": sorted(old_archs - new_archs),
+        "added_binaries": sorted(new_paths - old_paths),
+        "removed_binaries": sorted(old_paths - new_paths),
+        "dylib_changes": dylib_changes,
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="release-workbench",
@@ -218,6 +261,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     macho_info_parser.add_argument("app", help="path to the .app bundle directory")
 
+    diff_parser = subparsers.add_parser(
+        "diff-apps",
+        help="Compare two .app bundles (old then new) and emit a JSON report.",
+    )
+    diff_parser.add_argument("old_app", help="path to the old .app bundle directory")
+    diff_parser.add_argument("new_app", help="path to the new .app bundle directory")
+
     args = parser.parse_args(argv)
 
     if args.command is None:
@@ -237,6 +287,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             report = _collect_macho_info(args.app)
         except MachoInfoError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps(report))
+        return 0
+
+    if args.command == "diff-apps":
+        try:
+            report = _collect_apps_diff(args.old_app, args.new_app)
+        except (AppInfoError, MachoInfoError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
         print(json.dumps(report))
