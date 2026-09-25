@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import plistlib
+import re
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -12,13 +13,25 @@ from . import __version__
 
 INFO_PLIST_PATH = "Contents/Info.plist"
 
+VERSION_PATTERN = re.compile(r"^(0|[1-9]\d*)(\.(0|[1-9]\d*))*$")
+PROFILE_CPUS = ("arm64", "x86_64")
+PROFILE_FIELDS = frozenset({"os_version", "cpu"})
+
+# Thin Mach-O magics mapped to the architecture of their cputype.
+MACHO_MAGICS = {
+    b"\xfe\xed\xfa\xcf": "x86_64",  # FEEDFACF
+    b"\xfe\xed\xfa\xce": "i386",  # FEEDFACE
+    b"\xcf\xfa\xed\xfe": "arm64",  # CFFAEDFE
+    b"\xce\xfa\xed\xfe": "armv7",  # CEFAEDFE
+}
+
 
 class AppInfoError(Exception):
-    """Diagnostic failure for an ``app-info`` invocation."""
+    """Diagnostic failure for a command invocation."""
 
 
-def _collect_app_info(app_arg: str) -> dict:
-    """Inspect an ``.app`` bundle and return the JSON-serialisable report."""
+def _validate_app(app_arg: str) -> Path:
+    """Validate an ``.app`` bundle path and return its ``Contents`` directory."""
     app_path = app_arg  # keep the user-supplied spelling in diagnostics
     app = Path(app_arg)
 
@@ -32,23 +45,37 @@ def _collect_app_info(app_arg: str) -> dict:
     contents = app / "Contents"
     if not contents.is_dir():
         raise AppInfoError(f"{app_path}: missing Contents directory")
+    return contents
+
+
+def _load_info_plist(contents: Path) -> dict | None:
+    """Parse ``Contents/Info.plist``; return ``None`` when the file is absent."""
+    plist_file = contents / "Info.plist"
+    if not plist_file.exists():
+        return None
+    try:
+        plist_data = plistlib.loads(plist_file.read_bytes())
+    except Exception as exc:
+        raise AppInfoError(
+            f"{plist_file}: invalid property list ({exc})"
+        ) from exc
+    if not isinstance(plist_data, dict):
+        raise AppInfoError(
+            f"{plist_file}: property list root object is not a dictionary"
+        )
+    return plist_data
+
+
+def _collect_app_info(app_arg: str) -> dict:
+    """Inspect an ``.app`` bundle and return the JSON-serialisable report."""
+    contents = _validate_app(app_arg)
 
     components = sorted({"Contents/" + name for name in os.listdir(contents)})
 
-    plist_file = contents / "Info.plist"
+    plist_data = _load_info_plist(contents)
     bundle_id: str | None = None
     executable: str | None = None
-    if plist_file.exists():
-        try:
-            plist_data = plistlib.loads(plist_file.read_bytes())
-        except Exception as exc:
-            raise AppInfoError(
-                f"{plist_file}: invalid property list ({exc})"
-            ) from exc
-        if not isinstance(plist_data, dict):
-            raise AppInfoError(
-                f"{plist_file}: property list root object is not a dictionary"
-            )
+    if plist_data is not None:
         status = "ok"
         identifier = plist_data.get("CFBundleIdentifier")
         bundle_executable = plist_data.get("CFBundleExecutable")
@@ -68,6 +95,114 @@ def _collect_app_info(app_arg: str) -> dict:
     }
 
 
+def _load_profile(profile_arg: str) -> dict:
+    """Load and validate a target-Mac profile JSON file."""
+    try:
+        raw = Path(profile_arg).read_bytes()
+    except OSError as exc:
+        raise AppInfoError(f"{profile_arg}: cannot read profile ({exc})") from exc
+    try:
+        profile = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AppInfoError(f"{profile_arg}: invalid JSON profile ({exc})") from exc
+    if not isinstance(profile, dict):
+        raise AppInfoError(f"{profile_arg}: profile root must be an object")
+    extra = sorted(set(profile) - PROFILE_FIELDS)
+    if extra:
+        raise AppInfoError(
+            f"{profile_arg}: unexpected profile fields: {', '.join(extra)}"
+        )
+    os_version = profile.get("os_version")
+    if not isinstance(os_version, str) or not VERSION_PATTERN.match(os_version):
+        raise AppInfoError(f"{profile_arg}: invalid os_version")
+    cpu = profile.get("cpu")
+    if cpu not in PROFILE_CPUS:
+        raise AppInfoError(f"{profile_arg}: invalid cpu")
+    return {"os_version": os_version, "cpu": cpu}
+
+
+def _version_greater(left: str, right: str) -> bool:
+    """Compare dotted version strings numerically, segment by segment."""
+    left_parts = [int(part) for part in left.split(".")]
+    right_parts = [int(part) for part in right.split(".")]
+    for lhs, rhs in zip(left_parts, right_parts):
+        if lhs != rhs:
+            return lhs > rhs
+    return len(left_parts) > len(right_parts)
+
+
+def _detect_architectures(contents: Path, executable: str | None) -> list[str]:
+    """Return the sorted architectures of the bundle's thin Mach-O executable."""
+    if executable is None:
+        return []
+    macho = contents / "MacOS" / executable
+    try:
+        if not macho.is_file():
+            return []
+        with macho.open("rb") as stream:
+            magic = stream.read(4)
+    except OSError:
+        return []
+    arch = MACHO_MAGICS.get(magic)
+    return [arch] if arch is not None else []
+
+
+def _collect_compat_report(app_arg: str, profile: dict) -> dict:
+    """Build the compatibility report for an ``.app`` against a target profile."""
+    contents = _validate_app(app_arg)
+    plist_data = _load_info_plist(contents) or {}
+
+    identifier = plist_data.get("CFBundleIdentifier")
+    bundle_id = identifier if isinstance(identifier, str) else None
+    bundle_executable = plist_data.get("CFBundleExecutable")
+    executable = (
+        bundle_executable if isinstance(bundle_executable, str) else None
+    )
+
+    minimum = plist_data.get("LSMinimumSystemVersion")
+    required_os_version = (
+        minimum
+        if isinstance(minimum, str) and VERSION_PATTERN.match(minimum)
+        else None
+    )
+
+    architectures = _detect_architectures(contents, executable)
+
+    blocks = []
+    if required_os_version is not None and _version_greater(
+        required_os_version, profile["os_version"]
+    ):
+        blocks.append(
+            {
+                "code": "os-version",
+                "detail": {
+                    "required": required_os_version,
+                    "target": profile["os_version"],
+                },
+            }
+        )
+    if architectures and profile["cpu"] not in architectures:
+        blocks.append(
+            {
+                "code": "cpu",
+                "detail": {
+                    "supported": architectures,
+                    "target": profile["cpu"],
+                },
+            }
+        )
+    blocks.sort(key=lambda block: block["code"])
+
+    return {
+        "bundle_id": bundle_id,
+        "executable": executable,
+        "required_os_version": required_os_version,
+        "architectures": architectures,
+        "blocks": blocks,
+        "status": "compatible" if not blocks else "blocked",
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="release-workbench",
@@ -82,6 +217,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     app_info_parser.add_argument("app", help="path to the .app bundle directory")
 
+    compat_parser = subparsers.add_parser(
+        "compat-report",
+        help="Check a .app bundle against a target Mac profile and emit a JSON report.",
+    )
+    compat_parser.add_argument("app", help="path to the .app bundle directory")
+    compat_parser.add_argument("profile", help="path to the target profile JSON file")
+
     args = parser.parse_args(argv)
 
     if args.command is None:
@@ -91,6 +233,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "app-info":
         try:
             report = _collect_app_info(args.app)
+        except AppInfoError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps(report))
+        return 0
+
+    if args.command == "compat-report":
+        try:
+            profile = _load_profile(args.profile)
+            report = _collect_compat_report(args.app, profile)
         except AppInfoError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
