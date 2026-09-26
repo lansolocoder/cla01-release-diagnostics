@@ -8,6 +8,7 @@
 python3 -m release_workbench --help
 python3 -m release_workbench --version
 python3 -m release_workbench app-info /path/to/Example.app
+python3 -m release_workbench compare /path/to/Old.app /path/to/New.app
 python3 -m unittest discover -s tests -v
 ```
 
@@ -19,4 +20,12 @@ python3 -m unittest discover -s tests -v
 
 `bundle_id`、`executable` 取 `Contents/Info.plist`（标准库 `plistlib` 解析的 XML plist）中的 `CFBundleIdentifier`、`CFBundleExecutable` 字符串值，键缺失或非字符串时为 `null`；`info_plist` 恒为 `"Contents/Info.plist"`；`components` 是 `Contents/` 下一级子项相对包根的路径，按字典序升序并去重。存在且可解析 `Info.plist` 时 `status` 为 `"ok"`；文件缺失时为 `"missing-info-plist"`，此时成功退出（0）。路径不存在、不是目录、名称不以 `.app` 结尾、缺少 `Contents` 目录、`Info.plist` 非法或根对象不是字典时，诊断信息写入 stderr（含出错路径），stdout 为空，退出码 2。额外的 CLI 选项同样报错退出。
 
-帮助与版本查询入口保持可用；无参数显示帮助，未知参数以非零状态退出。尚未实现签名与信任检查、依赖与架构核对、发布比较以及更新渠道检查，不会创建或修改业务数据文件。
+帮助与版本查询入口保持可用；无参数显示帮助，未知参数以非零状态退出。尚未实现签名与信任检查、依赖与架构核对以及更新渠道检查，不会创建或修改业务数据文件。
+
+`compare old-app new-app` 比较两个 `.app` 包，向 stdout 输出单行 JSON：
+
+```json
+{"old": "/path/to/Old.app", "new": "/path/to/New.app", "added": ["Contents/Frameworks"], "removed": ["Contents/Resources"], "changed": [{"key": "CFBundleVersion", "old": null, "new": "42"}], "status": "differs"}
+```
+
+`old`、`new` 原样回显两个路径参数；`added`、`removed` 分别为仅出现在新包、仅出现在旧包的 `Contents/` 一级子项相对包根路径，按字典序升序。`changed` 只比较 `CFBundleIdentifier`、`CFBundleExecutable`、`CFBundleShortVersionString`、`CFBundleVersion`，键缺失或非字符串的一侧以 `null` 参与比较，仅一侧为 `null` 时记条目（如 `null`→"1.1" 表示该键新增）；两侧均非 `null` 且字面值不同（如 "1.0"→"2.0"）不记入 `changed`，而以 `status` 表示。`changed` 按键名字典序升序。`status` 为 `"match"`（`added`、`removed`、`changed` 均空）、`"differs"`（存在差异但无双侧不等的键）或 `"conflict"`（至少一个键两侧均非 `null` 且不等，此时 `changed` 与 `added`、`removed` 照常给出）。两个包沿用 `app-info` 的全部合法性要求；一侧 `Info.plist` 缺失时组件照常比较，四个键均视为 `null`。非法包、额外 CLI 选项报错退出码 2（诊断含出错元素，stdout 为空），成功退出码 0，全程不修改任何文件。

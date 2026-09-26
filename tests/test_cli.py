@@ -199,5 +199,146 @@ class AppInfoTests(unittest.TestCase):
         self.assertIn("--bogus", result.stderr)
 
 
+class CompareTests(unittest.TestCase):
+    def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "release_workbench", "compare", *arguments],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    @staticmethod
+    def make_app(root: Path, name: str, plist: object = None,
+                 items: tuple[str, ...] = ()) -> Path:
+        app = root / name
+        contents = app / "Contents"
+        contents.mkdir(parents=True)
+        for item in items:
+            (contents / item).mkdir()
+        if plist is not None:
+            _write_plist(contents / "Info.plist", plist)
+        return app
+
+    def test_identical_bundles_match(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plist = {"CFBundleIdentifier": "com.example.App",
+                     "CFBundleShortVersionString": "1.0"}
+            old = self.make_app(root, "Old.app", plist, ("MacOS",))
+            new = self.make_app(root, "New.app", plist, ("MacOS",))
+            result = self.invoke(str(old), str(new))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        report = json.loads(result.stdout)
+        self.assertEqual(
+            report,
+            {
+                "old": str(old),
+                "new": str(new),
+                "added": [],
+                "removed": [],
+                "changed": [],
+                "status": "match",
+            },
+        )
+        self.assertEqual(result.stdout.count("\n"), 1)
+
+    def test_components_and_key_additions_differ(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old = self.make_app(
+                root, "Old.app",
+                {"CFBundleIdentifier": "com.example.App"},
+                ("MacOS", "Resources"),
+            )
+            new = self.make_app(
+                root, "New.app",
+                {"CFBundleIdentifier": "com.example.App",
+                 "CFBundleVersion": "42"},
+                ("MacOS", "Frameworks"),
+            )
+            result = self.invoke(str(old), str(new))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["added"], ["Contents/Frameworks"])
+        self.assertEqual(report["removed"], ["Contents/Resources"])
+        self.assertEqual(
+            report["changed"],
+            [{"key": "CFBundleVersion", "old": None, "new": "42"}],
+        )
+        self.assertEqual(report["status"], "differs")
+
+    def test_both_sides_differ_is_a_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old = self.make_app(
+                root, "Old.app",
+                {"CFBundleShortVersionString": "1.0",
+                 "CFBundleVersion": "10"},
+            )
+            new = self.make_app(
+                root, "New.app",
+                {"CFBundleShortVersionString": "2.0"},
+            )
+            result = self.invoke(str(old), str(new))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["status"], "conflict")
+        self.assertEqual(
+            report["changed"],
+            [{"key": "CFBundleVersion", "old": "10", "new": None}],
+        )
+
+    def test_missing_info_plist_counts_as_null_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old = self.make_app(root, "Old.app")
+            new = self.make_app(
+                root, "New.app", {"CFBundleExecutable": "Tool"}
+            )
+            result = self.invoke(str(old), str(new))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["added"], ["Contents/Info.plist"])
+        self.assertEqual(
+            report["changed"],
+            [{"key": "CFBundleExecutable", "old": None, "new": "Tool"}],
+        )
+        self.assertEqual(report["status"], "differs")
+
+    def test_invalid_old_bundle_is_an_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            new = self.make_app(root, "New.app", {})
+            result = self.invoke(str(root / "Missing.app"), str(new))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("Missing.app", result.stderr)
+
+    def test_invalid_new_bundle_is_an_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old = self.make_app(root, "Old.app", {})
+            broken = self.make_app(root, "Broken.app")
+            (broken / "Contents" / "Info.plist").write_text("<<< nope >>>")
+            result = self.invoke(str(old), str(broken))
+            plist_path = str(broken / "Contents" / "Info.plist")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn(plist_path, result.stderr)
+
+    def test_extra_option_is_an_error(self) -> None:
+        result = self.invoke("Old.app", "New.app", "--bogus")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("--bogus", result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
