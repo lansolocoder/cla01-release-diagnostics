@@ -1,6 +1,7 @@
 """Checks for the documented command-line entry point."""
 
 import json
+import os
 from pathlib import Path
 import plistlib
 import subprocess
@@ -494,6 +495,250 @@ class CompatReportTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2, result.stdout)
             self.assertEqual(result.stdout, "")
             self.assertNotEqual(result.stderr, "")
+
+
+class ReleaseDiffTests(unittest.TestCase):
+    def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "release_workbench", "release-diff", *arguments],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def make_app(
+        self,
+        tmp: str,
+        name: str,
+        plist: object = None,
+        files: dict[str, bytes] | None = None,
+        dirs: tuple[str, ...] = (),
+        symlinks: tuple[tuple[str, str], ...] = (),
+        create_plist: bool = False,
+    ) -> Path:
+        app = Path(tmp) / name
+        contents = app / "Contents"
+        contents.mkdir(parents=True)
+        if create_plist or plist is not None:
+            _write_plist(contents / "Info.plist", plist if plist is not None else {})
+        for directory in dirs:
+            (contents / directory).mkdir()
+        for filename, data in (files or {}).items():
+            (contents / filename).write_bytes(data)
+        for link, target in symlinks:
+            (contents / link).symlink_to(target)
+        return app
+
+    BASE_PLIST = {
+        "CFBundleIdentifier": "com.example.App",
+        "CFBundleExecutable": "Example",
+        "LSMinimumSystemVersion": "11.0",
+    }
+
+    def test_identical_bundles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self.make_app(
+                tmp, "Old.app", self.BASE_PLIST, files={"bin": b"abc"}, dirs=("MacOS",)
+            )
+            new = self.make_app(
+                tmp, "New.app", self.BASE_PLIST, files={"bin": b"abc"}, dirs=("MacOS",)
+            )
+            result = self.invoke(str(old), str(new))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        report = json.loads(result.stdout)
+        self.assertEqual(
+            report,
+            {"changes": [], "missing_in_new": [], "added_in_new": [], "status": "identical"},
+        )
+        self.assertEqual(result.stdout.count("\n"), 1)
+
+    def test_full_diff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self.make_app(
+                tmp,
+                "Old.app",
+                self.BASE_PLIST,
+                files={"gone": b"x", "bin": b"old-long"},
+                dirs=("Resources",),
+                symlinks=(("link", "bin"),),
+            )
+            new_plist = dict(self.BASE_PLIST, CFBundleIdentifier="com.example.Other")
+            new = self.make_app(
+                tmp,
+                "New.app",
+                new_plist,
+                files={"fresh": b"y", "bin": b"new"},
+                dirs=("Resources",),
+                symlinks=(("link", "bin"),),
+            )
+            result = self.invoke(str(old), str(new))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["missing_in_new"], ["Contents/gone"])
+        self.assertEqual(report["added_in_new"], ["Contents/fresh"])
+        self.assertEqual(report["status"], "changed")
+        # Directories and symlinks that exist on both sides produce no entry.
+        self.assertTrue(
+            all(
+                change["path"] not in ("Contents/Resources", "Contents/link")
+                for change in report["changes"]
+            )
+        )
+        metadata = [c for c in report["changes"] if c["kind"] == "metadata"]
+        self.assertEqual(
+            metadata,
+            [
+                {
+                    "kind": "metadata",
+                    "path": "Contents/Info.plist",
+                    "detail": {
+                        "key": "CFBundleIdentifier",
+                        "old": "com.example.App",
+                        "new": "com.example.Other",
+                    },
+                }
+            ],
+        )
+        modified = [c for c in report["changes"] if c["kind"] == "modified" and c["path"] == "Contents/bin"]
+        self.assertEqual(
+            modified,
+            [{"kind": "modified", "path": "Contents/bin", "detail": {"old_size": 8, "new_size": 3}}],
+        )
+        # changes sorted by (kind, path).
+        keys = [(c["kind"], c["path"]) for c in report["changes"]]
+        self.assertEqual(keys, sorted(keys))
+
+    def test_metadata_keys_sorted_with_nulls(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self.make_app(
+                tmp,
+                "Old.app",
+                {"CFBundleIdentifier": "a", "CFBundleExecutable": "X", "LSMinimumSystemVersion": 12},
+            )
+            new = self.make_app(
+                tmp,
+                "New.app",
+                {"CFBundleIdentifier": "b", "CFBundleExecutable": "Y", "LSMinimumSystemVersion": "13.0"},
+            )
+            result = self.invoke(str(old), str(new))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        metadata = [
+            change
+            for change in json.loads(result.stdout)["changes"]
+            if change["kind"] == "metadata"
+        ]
+        self.assertEqual(
+            [(c["detail"]["key"], c["detail"]["old"], c["detail"]["new"]) for c in metadata],
+            [
+                ("CFBundleExecutable", "X", "Y"),
+                ("CFBundleIdentifier", "a", "b"),
+                ("LSMinimumSystemVersion", None, "13.0"),
+            ],
+        )
+
+    def test_invalid_minimum_version_counts_as_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self.make_app(tmp, "Old.app", {"LSMinimumSystemVersion": "01.0"})
+            new = self.make_app(tmp, "New.app", {"LSMinimumSystemVersion": "1..2"})
+            result = self.invoke(str(old), str(new))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        metadata = [
+            c for c in json.loads(result.stdout)["changes"] if c["kind"] == "metadata"
+        ]
+        self.assertEqual(metadata, [])
+
+    def test_both_missing_key_emits_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self.make_app(tmp, "Old.app", {"CFBundleIdentifier": "a"})
+            new = self.make_app(tmp, "New.app", {"CFBundleIdentifier": "a"})
+            result = self.invoke(str(old), str(new))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(
+            [c for c in report["changes"] if c["kind"] == "metadata"], []
+        )
+        self.assertEqual(report["status"], "identical")
+
+    def test_missing_plist_one_skips_metadata_but_lists_component(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self.make_app(tmp, "Old.app", None)
+            new = self.make_app(tmp, "New.app", self.BASE_PLIST)
+            result = self.invoke(str(old), str(new))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["added_in_new"], ["Contents/Info.plist"])
+        self.assertEqual(
+            [c for c in report["changes"] if c["kind"] == "metadata"], []
+        )
+
+    def test_invalid_plist_is_exit_2(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self.make_app(tmp, "Old.app", self.BASE_PLIST)
+            new = self.make_app(tmp, "New.app", None)
+            (new / "Contents" / "Info.plist").write_text("<<< not a plist >>>")
+            result = self.invoke(str(old), str(new))
+            new_plist = str(new / "Contents" / "Info.plist")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn(new_plist, result.stderr)
+        self.assertIn(str(old), result.stderr)
+        self.assertEqual(result.stderr.count("error:"), 1)
+
+    def test_invalid_plist_on_old_side_reports_old_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self.make_app(tmp, "Old.app", None)
+            (old / "Contents" / "Info.plist").write_text("<<< not a plist >>>")
+            new = self.make_app(tmp, "New.app", self.BASE_PLIST)
+            result = self.invoke(str(old), str(new))
+            old_plist = str(old / "Contents" / "Info.plist")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn(old_plist, result.stderr)
+        self.assertNotIn(str(new), result.stderr)
+
+    def test_new_bundle_invalid_reports_both_paths_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self.make_app(tmp, "Old.app", self.BASE_PLIST)
+            new = Path(tmp) / "Plain.app"
+            new.write_text("not a bundle")
+            result = self.invoke(str(old), str(new))
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn(str(old), result.stderr)
+        self.assertIn(str(new), result.stderr)
+        self.assertEqual(result.stderr.count("error:"), 1)
+
+    def test_old_bundle_invalid_follows_app_diagnostic(self) -> None:
+        result = self.invoke("/nonexistent/Old.app", "/nonexistent/New.app")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("/nonexistent/Old.app", result.stderr)
+        self.assertNotIn("/nonexistent/New.app", result.stderr)
+
+    def test_unreadable_shared_file_produces_no_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self.make_app(tmp, "Old.app", files={"secret": b"aaaa"})
+            new = self.make_app(tmp, "New.app", files={"secret": b"bbbb"})
+            (new / "Contents" / "secret").chmod(0o000)
+            result = self.invoke(str(old), str(new))
+            (new / "Contents" / "secret").chmod(0o644)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        if os.geteuid() != 0:
+            self.assertNotIn("Contents/secret", [c["path"] for c in report["changes"]])
+            self.assertEqual(report["status"], "identical")
 
 
 if __name__ == "__main__":

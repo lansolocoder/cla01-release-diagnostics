@@ -8,6 +8,7 @@
 python3 -m release_workbench --help
 python3 -m release_workbench --version
 python3 -m release_workbench app-info /path/to/Example.app
+python3 -m release_workbench release-diff /path/to/Old.app /path/to/New.app
 python3 -m unittest discover -s tests -v
 ```
 
@@ -33,4 +34,22 @@ profile 是 UTF-8 JSON 对象，仅含两个字段：`os_version` 为点分十�
 
 `required_os_version` 取 `LSMinimumSystemVersion` 字符串值，键缺失、非字符串或不合版本语法时为 `null`；`architectures` 为 `Contents/MacOS/<executable>` 的 Mach-O 薄 magic（FEEDFACF/FEEDFACE 按 cputype 为 x86_64/i386，CFFAEDFE/CEFAEDFE 为 arm64/armv7）识别出的架构，去重升序；可执行文件缺失、非普通文件、读取失败、magic 未知或为 FAT（CAFEBABE/BEBAFECA）时为空列表。`blocks` 每项含 `code` 与 `detail`：`required_os_version` 大于目标 `os_version` 时出现 `os-version`（点分段数值比较，共有段相同则段多者大），detail 为 `{"required": ..., "target": ...}`；`architectures` 非空且不含目标 cpu 时出现 `cpu`，detail 为 `{"supported": [...], "target": ...}`。每种 code 至多一项，按 code 升序排列。无 blocks 时 `status` 为 `"compatible"`，否则为 `"blocked"`。app 侧无效输入的诊断与 `app-info` 一致。
 
-帮助与版本查询入口保持可用；无参数显示帮助，未知参数以非零状态退出。尚未实现签名与信任检查、依赖核对、发布比较以及更新渠道检查，不会创建或修改业务数据文件。
+`release-diff` 比较两次发布产物，回答“这次改版动了什么”：
+
+```bash
+python3 -m release_workbench release-diff /path/to/Old.app /path/to/New.app
+```
+
+输出单行 JSON 对象，字段固定为 `changes`、`missing_in_new`、`added_in_new`、`status`：
+
+```json
+{"changes": [{"kind": "metadata", "path": "Contents/Info.plist", "detail": {"key": "CFBundleIdentifier", "old": "com.example.App", "new": "com.example.New"}}, {"kind": "modified", "path": "Contents/MacOS/App", "detail": {"old_size": 120, "new_size": 128}}], "missing_in_new": ["Contents/Resources/old.png"], "added_in_new": ["Contents/Resources/new.png"], "status": "changed"}
+```
+
+两侧 `Info.plist` 都存在且可解析（根对象为字典）时，按键名字典序比较 `CFBundleExecutable`、`CFBundleIdentifier`、`LSMinimumSystemVersion`：取值规则同现有命令——非字符串或（仅 `LSMinimumSystemVersion`）不合版本语法视同缺失。同键两侧值不同（含一侧缺失）时输出一项 `kind="metadata"`、`path="Contents/Info.plist"`、`detail={"key": 键名, "old": 旧值, "new": 新值}`，缺失侧为 `null`；两侧皆缺失不输出。任一侧 `Info.plist` 缺失时 metadata 比较整体跳过。
+
+`missing_in_new`、`added_in_new` 分别列出仅存在于旧包、仅存在于新包的 `Contents/` 下一级子项相对路径（形如 `Contents/MacOS`），字典序升序。两侧都存在且都是普通文件的下一级子项按原始字节比较（目录、symlink、不可读文件不比较也不产条目）：字节不同输出 `kind="modified"`、`path` 为该子项相对路径、`detail={"old_size": 旧字节数, "new_size": 新字节数}`。`changes` 按 `(kind, path)` 字典序排序。所有差异均为空时 `status` 为 `"identical"`，否则为 `"changed"`。
+
+任一包校验失败沿用 app 侧诊断规则（stderr 含出错路径、stdout 为空、退出码 2）。先校验旧包：旧包出错时只报告旧路径；旧包通过后新包才校验，新包出错（路径非法或 `Info.plist` 非法、根非字典）时 stderr 只输出一次诊断且同时包含新旧两路径，不输出部分报告。
+
+帮助与版本查询入口保持可用；无参数显示帮助，未知参数以非零状态退出。尚未实现签名与信任检查、依赖核对以及更新渠道检查，不会创建或修改业务数据文件。
