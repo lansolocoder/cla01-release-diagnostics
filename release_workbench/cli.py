@@ -5,6 +5,7 @@ import json
 import os
 import plistlib
 import re
+import stat
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -203,6 +204,103 @@ def _collect_compat_report(app_arg: str, profile: dict) -> dict:
     }
 
 
+def _string_value(plist_data: dict, key: str) -> str | None:
+    """Return the string value of ``key``; anything else counts as missing."""
+    value = plist_data.get(key)
+    return value if isinstance(value, str) else None
+
+
+def _version_value(plist_data: dict, key: str) -> str | None:
+    """Return the version-string value of ``key``; invalid syntax counts as missing."""
+    value = plist_data.get(key)
+    if isinstance(value, str) and VERSION_PATTERN.match(value):
+        return value
+    return None
+
+
+# Info.plist keys compared by release-diff, with their value extraction rules.
+METADATA_KEYS = {
+    "CFBundleIdentifier": _string_value,
+    "CFBundleExecutable": _string_value,
+    "LSMinimumSystemVersion": _version_value,
+}
+
+
+def _read_regular_file(path: Path) -> bytes | None:
+    """Return the bytes of a regular file; ``None`` for anything else/unreadable."""
+    try:
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            return None
+        return path.read_bytes()
+    except OSError:
+        return None
+
+
+def _collect_release_diff(old_arg: str, new_arg: str) -> dict:
+    """Compare two ``.app`` bundles and return the JSON-serialisable diff report."""
+    old_contents = _validate_app(old_arg)
+    try:
+        new_contents = _validate_app(new_arg)
+    except AppInfoError as exc:
+        raise AppInfoError(f"{exc} (old bundle: {old_arg})") from exc
+
+    old_plist = _load_info_plist(old_contents)
+    try:
+        new_plist = _load_info_plist(new_contents)
+    except AppInfoError as exc:
+        raise AppInfoError(f"{exc} (old bundle: {old_arg})") from exc
+
+    changes = []
+    if old_plist is not None and new_plist is not None:
+        for key in sorted(METADATA_KEYS):
+            extractor = METADATA_KEYS[key]
+            old_value = extractor(old_plist, key)
+            new_value = extractor(new_plist, key)
+            if old_value != new_value:
+                changes.append(
+                    {
+                        "kind": "metadata",
+                        "path": INFO_PLIST_PATH,
+                        "detail": {"key": key, "old": old_value, "new": new_value},
+                    }
+                )
+
+    old_names = set(os.listdir(old_contents))
+    new_names = set(os.listdir(new_contents))
+    missing_in_new = sorted("Contents/" + name for name in old_names - new_names)
+    added_in_new = sorted("Contents/" + name for name in new_names - old_names)
+
+    for name in sorted(old_names & new_names):
+        old_bytes = _read_regular_file(old_contents / name)
+        new_bytes = _read_regular_file(new_contents / name)
+        if old_bytes is None or new_bytes is None:
+            continue
+        if old_bytes != new_bytes:
+            changes.append(
+                {
+                    "kind": "modified",
+                    "path": "Contents/" + name,
+                    "detail": {
+                        "old_size": len(old_bytes),
+                        "new_size": len(new_bytes),
+                    },
+                }
+            )
+
+    changes.sort(key=lambda change: (change["kind"], change["path"]))
+    status = (
+        "identical"
+        if not (changes or missing_in_new or added_in_new)
+        else "changed"
+    )
+    return {
+        "changes": changes,
+        "missing_in_new": missing_in_new,
+        "added_in_new": added_in_new,
+        "status": status,
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="release-workbench",
@@ -224,6 +322,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     compat_parser.add_argument("app", help="path to the .app bundle directory")
     compat_parser.add_argument("profile", help="path to the target profile JSON file")
 
+    diff_parser = subparsers.add_parser(
+        "release-diff",
+        help="Compare two .app release bundles and emit a JSON diff report.",
+    )
+    diff_parser.add_argument("old_app", help="path to the previous .app bundle")
+    diff_parser.add_argument("new_app", help="path to the new .app bundle")
+
     args = parser.parse_args(argv)
 
     if args.command is None:
@@ -243,6 +348,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             profile = _load_profile(args.profile)
             report = _collect_compat_report(args.app, profile)
+        except AppInfoError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps(report))
+        return 0
+
+    if args.command == "release-diff":
+        try:
+            report = _collect_release_diff(args.old_app, args.new_app)
         except AppInfoError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
