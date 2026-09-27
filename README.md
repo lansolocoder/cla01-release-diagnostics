@@ -12,6 +12,7 @@ python3 -m release_workbench macho-info /path/to/Example.app
 python3 -m release_workbench diff-apps /path/to/Old.app /path/to/New.app
 python3 -m release_workbench sign-info /path/to/Example.app
 python3 -m release_workbench dep-check /path/to/Example.app x86_64
+python3 -m release_workbench update-check /path/to/Example.app
 python3 -m unittest discover -s tests -v
 ```
 
@@ -57,4 +58,12 @@ python3 -m unittest discover -s tests -v
 
 `missing_arch_binaries` 为架构标签不等于目标架构的 binary 相对包根路径，升序；`unresolved_dylibs` 为 `@` 开头（如 `@rpath`、`@loader_path`、`@executable_path`）的依赖，无法静态定位，去重升序；指向包内 `Contents/Frameworks/` 的依赖不计入任何列表；其余绝对路径依赖为外部依赖，进 `external_dylibs`，去重升序。`missing_dylibs` 为外部依赖中宿主上缺失者：`/usr/lib/`、`/System/` 开头视作存在，其余直接查文件系统是否存在，去重升序。`status` 优先级：`missing_dylibs` 非空为 `"missing-deps"`；否则 `missing_arch_binaries` 非空为 `"arch-mismatch"`；否则为 `"ok"`。包内无 Mach-O 时三个列表均为空、`status` 为 `"ok"`。包级校验（路径不存在、非目录、名称不以 `.app` 结尾、缺少 `Contents`）与其他命令一致；目标架构标签非法时诊断信息写入 stderr（含出错值），stdout 为空，退出码 2；包内 Mach-O 畸形沿用 `macho-info` 失败规则（诊断含出错文件路径，stdout 为空，退出码 2，不输出部分结果）。成功时退出码 0、stderr 为空、stdout 恰一行 JSON。
 
-尚未实现签名信任评估以及更新渠道检查，不会创建或修改业务数据文件。
+`update-check` 只做本地静态检查（不访问网络），读取 `Contents/Info.plist` 中的 `SUFeedURL`（更新渠道地址）与 `CFBundleShortVersionString`（当前版本），向 stdout 输出单行 JSON：
+
+```json
+{"channel_url": "https://updates.example.com/appcast.xml", "current_version": "1.2.0", "url_scheme_ok": true, "version_comparable": true, "version_segments": [1, 2, 0], "status": "ok"}
+```
+
+`channel_url`、`current_version` 取对应键的字符串值，键缺失或非字符串时为 `null`；`url_scheme_ok` 表示 `channel_url` 以 `https://` 或 `http://` 开头且主机名非空，`channel_url` 为 `null` 时为 `false`；`version_comparable` 表示版本非空且可完整分割为点分隔的非负整数段（不允许空段或非数字），不可比或为 `null` 时为 `false` 且 `version_segments` 为 `null`，可比时 `version_segments` 为各段整数数组。`status` 优先级：`channel_url` 为 `null` 时为 `"missing-config"`；否则 `url_scheme_ok` 为 `false` 时为 `"bad-url"`；否则 `version_comparable` 为 `false` 时为 `"bad-version"`；否则为 `"ok"`。包级校验（路径不存在、非目录、名称不以 `.app` 结尾、缺少 `Contents`）与其他命令一致；`Info.plist` 缺失或非法时同样诊断写 stderr（含出错路径）、stdout 为空、退出码 2。成功时退出码 0、stderr 为空、stdout 恰一行 JSON，与包内 Mach-O 无关。
+
+尚未实现签名信任评估，不会创建或修改业务数据文件。

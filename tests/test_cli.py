@@ -1273,5 +1273,234 @@ class DepCheckTests(unittest.TestCase):
             self.assertIn(str(no_contents), result.stderr)
 
 
+class UpdateCheckTests(unittest.TestCase):
+    def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "release_workbench", "update-check", *arguments],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def make_bundle(self, tmp: str, plist: object = ..., name: str = "Example.app") -> Path:
+        app = Path(tmp) / name
+        contents = app / "Contents"
+        contents.mkdir(parents=True)
+        if plist is not ...:
+            _write_plist(contents / "Info.plist", plist)
+        return app
+
+    def test_ok_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_bundle(
+                tmp,
+                {
+                    "SUFeedURL": "https://updates.example.com/appcast.xml",
+                    "CFBundleShortVersionString": "1.2.0",
+                },
+            )
+            result = self.invoke(str(app))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(result.stdout.count("\n"), 1)
+        report = json.loads(result.stdout)
+        self.assertEqual(
+            report,
+            {
+                "channel_url": "https://updates.example.com/appcast.xml",
+                "current_version": "1.2.0",
+                "url_scheme_ok": True,
+                "version_comparable": True,
+                "version_segments": [1, 2, 0],
+                "status": "ok",
+            },
+        )
+
+    def test_missing_keys_give_missing_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_bundle(tmp, {})
+            result = self.invoke(str(app))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(
+            report,
+            {
+                "channel_url": None,
+                "current_version": None,
+                "url_scheme_ok": False,
+                "version_comparable": False,
+                "version_segments": None,
+                "status": "missing-config",
+            },
+        )
+
+    def test_non_string_values_become_null(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_bundle(
+                tmp, {"SUFeedURL": 42, "CFBundleShortVersionString": ["1", "2"]}
+            )
+            result = self.invoke(str(app))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertIsNone(report["channel_url"])
+        self.assertIsNone(report["current_version"])
+        self.assertEqual(report["status"], "missing-config")
+
+    def test_bad_url_status(self) -> None:
+        for url in (
+            "ftp://updates.example.com/appcast.xml",
+            "https://",
+            "https:///appcast.xml",
+            "not-a-url",
+            "",
+        ):
+            with self.subTest(url=url), tempfile.TemporaryDirectory() as tmp:
+                app = self.make_bundle(
+                    tmp,
+                    {
+                        "SUFeedURL": url,
+                        "CFBundleShortVersionString": "1.2.0",
+                    },
+                )
+                result = self.invoke(str(app))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                report = json.loads(result.stdout)
+                self.assertEqual(report["channel_url"], url)
+                self.assertFalse(report["url_scheme_ok"])
+                self.assertEqual(report["status"], "bad-url")
+
+    def test_http_scheme_and_host_with_port_are_ok(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_bundle(
+                tmp,
+                {
+                    "SUFeedURL": "http://updates.example.com:8080/appcast.xml",
+                    "CFBundleShortVersionString": "1.2.0",
+                },
+            )
+            result = self.invoke(str(app))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertTrue(report["url_scheme_ok"])
+        self.assertEqual(report["status"], "ok")
+
+    def test_bad_version_status(self) -> None:
+        for version in ("", "1..2", "1.2.x", "1.2.", ".1", "1.2-beta"):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as tmp:
+                app = self.make_bundle(
+                    tmp,
+                    {
+                        "SUFeedURL": "https://updates.example.com/appcast.xml",
+                        "CFBundleShortVersionString": version,
+                    },
+                )
+                result = self.invoke(str(app))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                report = json.loads(result.stdout)
+                self.assertEqual(report["current_version"], version)
+                self.assertFalse(report["version_comparable"])
+                self.assertIsNone(report["version_segments"])
+                self.assertEqual(report["status"], "bad-version")
+
+    def test_version_segments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_bundle(
+                tmp,
+                {
+                    "SUFeedURL": "https://updates.example.com/appcast.xml",
+                    "CFBundleShortVersionString": "10.04.7",
+                },
+            )
+            result = self.invoke(str(app))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertTrue(report["version_comparable"])
+        self.assertEqual(report["version_segments"], [10, 4, 7])
+        self.assertEqual(report["status"], "ok")
+
+    def test_missing_version_with_valid_url(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_bundle(
+                tmp, {"SUFeedURL": "https://updates.example.com/appcast.xml"}
+            )
+            result = self.invoke(str(app))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertIsNone(report["current_version"])
+        self.assertFalse(report["version_comparable"])
+        self.assertIsNone(report["version_segments"])
+        self.assertEqual(report["status"], "bad-version")
+
+    def test_bundle_validation_errors(self) -> None:
+        result = self.invoke("/nonexistent/Nope.app")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("/nonexistent/Nope.app", result.stderr)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            app = Path(tmp) / "File.app"
+            app.write_text("not a bundle")
+            result = self.invoke(str(app))
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.stdout, "")
+            self.assertIn(str(app), result.stderr)
+
+            bundle = Path(tmp) / "Example"
+            (bundle / "Contents").mkdir(parents=True)
+            result = self.invoke(str(bundle))
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.stdout, "")
+            self.assertIn(str(bundle), result.stderr)
+
+            no_contents = Path(tmp) / "NoContents.app"
+            no_contents.mkdir()
+            result = self.invoke(str(no_contents))
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.stdout, "")
+            self.assertIn(str(no_contents), result.stderr)
+
+    def test_missing_info_plist_is_an_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_bundle(tmp)
+            plist_file = app / "Contents" / "Info.plist"
+            result = self.invoke(str(app))
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.stdout, "")
+            self.assertIn(str(plist_file), result.stderr)
+
+    def test_invalid_info_plist_is_an_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_bundle(tmp)
+            broken = app / "Contents" / "Info.plist"
+            broken.write_text("<<< not a plist >>>")
+            result = self.invoke(str(app))
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.stdout, "")
+            self.assertIn(str(broken), result.stderr)
+
+    def test_info_plist_root_not_dictionary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_bundle(tmp, ["not", "a", "dict"])
+            plist_file = app / "Contents" / "Info.plist"
+            result = self.invoke(str(app))
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.stdout, "")
+            self.assertIn(str(plist_file), result.stderr)
+
+    def test_extra_option_is_an_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_bundle(tmp, {})
+            result = self.invoke(str(app), "--extra")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+
+
 if __name__ == "__main__":
     unittest.main()
