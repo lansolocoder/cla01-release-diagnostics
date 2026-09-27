@@ -9,6 +9,7 @@ python3 -m release_workbench --help
 python3 -m release_workbench --version
 python3 -m release_workbench app-info /path/to/Example.app
 python3 -m release_workbench macho-info /path/to/Example.app
+python3 -m release_workbench sign-info /path/to/Example.app
 python3 -m release_workbench diff-apps /path/to/Old.app /path/to/New.app
 python3 -m unittest discover -s tests -v
 ```
@@ -39,4 +40,12 @@ python3 -m unittest discover -s tests -v
 
 `added_components`/`removed_components`、`added_architectures`/`removed_architectures`、`added_binaries`/`removed_binaries` 分别为两侧 components、architectures、binary 相对路径的集合差（新减旧、旧减新），升序；`dylib_changes` 只含两侧都存在且 dylib 集合不同的 binary，按 `path` 升序，其 `added`/`removed` 为该 binary 两侧 dylibs 的集合差。`bundle_id_changed`、`executable_changed` 表示两侧 `CFBundleIdentifier`、`CFBundleExecutable` 是否不等（`Info.plist` 缺失或值非字符串时按 `null` 比较，`null` 与字符串不等也算改变）。两侧完全一致时列表全空、布尔均为 `false`。校验先旧包后新包：任一包路径不存在、非目录、名称不以 `.app` 结尾、缺少 `Contents`，或任一侧 `Info.plist` 非法、包内 Mach-O 畸形时，诊断信息写入 stderr（含出错路径），stdout 为空，退出码 2，不输出部分比较结果。成功时退出码 0、stderr 为空、stdout 恰一行 JSON。
 
-尚未实现签名与信任检查、依赖与架构核对以及更新渠道检查，不会创建或修改业务数据文件。
+`sign-info` 按 `macho-info` 同样的规则遍历包内 Mach-O（`Contents/MacOS/`、`Contents/Resources/` 第一级子项，递归进子目录、符号链接跳过不跟随，按文件原始字节判定 Mach-O 魔数，fat binary 同样跳过），逐个解析 `LC_CODE_SIGNATURE` 负载命令定位 embedded 签名目录（SuperBlob），向 stdout 输出单行 JSON：
+
+```json
+{"binaries": [{"path": "Contents/MacOS/App", "status": "signed", "identifier": "com.example.App", "team_id": "ABCD123456", "entries": ["CodeDirectory", "SignatureSlot"]}], "unsigned_binaries": []}
+```
+
+`binaries` 按相对包根、`/` 分隔的 `path` 升序。存在 `LC_CODE_SIGNATURE` 且目录完整时 `status` 为 `"signed"`，无该命令时为 `"unsigned"`，此时 `identifier`、`team_id` 为 `null`、`entries` 为空数组，且该相对路径同时进入 `unsigned_binaries`（升序）。签名时 `identifier` 取签名目录 CodeDirectory 中的标识字符串，`team_id` 取团队标识（CodeDirectory 版本过低或缺该字段时为 `null`）；`entries` 为 SuperBlob 索引表各槽位类型名称（如 `CodeDirectory`、`InfoSlot`、`RequirementsSlot`、`ResourceDirSlot`、`ApplicationSlot`、`EntitlementsSlot`、`DEREntitlementsSlot`、`AlternateCodeDirectorySlot`、`SignatureSlot`、`IdentificationSlot`、`TicketSlot`，未知槽位记为 `Slot<编号>`），去重升序。包内无 Mach-O 或全部未签名时正常输出并退出 0。包级校验（路径不存在、非目录、名称不以 `.app` 结尾、缺少 `Contents`）与 `macho-info` 一致；Mach-O 头或负载命令畸形、`LC_CODE_SIGNATURE` 数据偏移或长度越出文件、签名目录 magic 非嵌入式签名（`0xFADE0CC0`）、目录长度与索引表/槽位不符、索引表条目或槽位偏移越界时，诊断信息写入 stderr（含出错文件路径），stdout 为空，退出码 2，不输出部分结果。成功时退出码 0、stderr 为空、stdout 恰一行 JSON。
+
+尚未实现依赖与架构核对以及更新渠道检查，不会创建或修改业务数据文件。
