@@ -11,6 +11,7 @@ python3 -m release_workbench app-info /path/to/Example.app
 python3 -m release_workbench macho-info /path/to/Example.app
 python3 -m release_workbench diff-apps /path/to/Old.app /path/to/New.app
 python3 -m release_workbench sign-info /path/to/Example.app
+python3 -m release_workbench dep-check /path/to/Example.app x86_64
 python3 -m unittest discover -s tests -v
 ```
 
@@ -48,4 +49,12 @@ python3 -m unittest discover -s tests -v
 
 `binaries` 按相对包根、`/` 分隔的 `path` 升序：存在 `LC_CODE_SIGNATURE` 且签名目录完整时 `status` 为 `"signed"`，无 `LC_CODE_SIGNATURE` 时为 `"unsigned"`。`identifier` 取签名目录 CodeDirectory 中的标识字符串；`team_id` 取团队标识（版本低于支持团队标识的 CodeDirectory 或字段缺失时为 `null`）；`entries` 为索引表各槽位类型名称（如 `CodeDirectory`、`InfoSlot`、`RequirementsSlot`、`ResourceDir`、`ApplicationSlot`、`EntitlementsSlot`、`DEREntitlementsSlot`、`SignatureSlot`、`IdentificationSlot`、`TicketSlot`，主 CodeDirectory 与备选 CodeDirectory 槽位都记为 `CodeDirectory`），去重升序。未签名时 `identifier`、`team_id` 为 `null`、`entries` 为空数组，且该相对路径同时进入 `unsigned_binaries`（升序）。包内无 Mach-O 或全部未签名时正常输出并退出 0。包级校验（路径不存在、非目录、名称不以 `.app` 结尾、缺少 `Contents`）与其他命令一致；`LC_CODE_SIGNATURE` 数据偏移或长度越出文件、签名目录魔数非嵌入式签名（`0xfade0cc0`）、目录长度与负载不符、索引表条目或槽位偏移越界、缺少 CodeDirectory 槽位时，诊断信息写入 stderr（含出错文件路径），stdout 为空，退出码 2，不输出部分结果。本命令只解析签名目录结构，不校验证书链与信任状态。
 
-尚未实现签名信任评估、依赖与架构核对以及更新渠道检查，不会创建或修改业务数据文件。
+`dep-check` 接收 `.app` 包路径与目标架构标签两个位置参数，按 `macho-info` 同样的规则遍历包内 Mach-O（`Contents/MacOS/` 与 `Contents/Resources/`，递归进子目录、跳过符号链接，按原始字节魔数判定），读取各 binary 的 `LC_LOAD_DYLIB` 依赖并核对架构覆盖，向 stdout 输出单行 JSON：
+
+```json
+{"target_arch": "x86_64", "missing_arch_binaries": ["Contents/MacOS/Helper"], "external_dylibs": ["/usr/lib/libSystem.B.dylib"], "missing_dylibs": ["/opt/local/lib/libssl.dylib"], "unresolved_dylibs": ["@rpath/libPlug.dylib"], "status": "missing-deps"}
+```
+
+依赖按 LC_LOAD_DYLIB 路径分类：`@` 开头（`@rpath/`、`@executable_path/`、`@loader_path/` 等）进 `unresolved_dylibs`；绝对路径指向包内 `Contents/Frameworks/`（按 `normpath` 前缀匹配，不访问文件系统）的不计入；其余绝对路径为外部依赖，两列表各自去重升序。`missing_dylibs` 为外部依赖中宿主缺失者：`/usr/lib/`、`/System/` 开头一律视作存在，其余直接查文件系统，去重升序。`missing_arch_binaries` 为架构标签与目标架构不一致的 binary 相对路径（单架构 slice），升序；目标架构标签限 `macho-info` 四种（`i386`、`ppc`、`x86_64`、`ppc64`）。`status` 优先级：`missing_dylibs` 非空为 `"missing-deps"`；否则 `missing_arch_binaries` 非空为 `"arch-mismatch"`；否则 `"ok"`。包内无 Mach-O 时三列表为空、`status` 为 `"ok"`。包级校验（路径不存在、非目录、名称不以 `.app` 结尾、缺少 `Contents`）与其他命令一致；目标架构标签非法时诊断写 stderr（含出错值），stdout 空，退出码 2；Mach-O 畸形沿 `macho-info` 失败规则（诊断含出错文件路径，stdout 空，退出码 2，不输出部分结果）。成功时退出码 0、stderr 为空、stdout 恰一行 JSON。
+
+尚未实现签名信任评估以及更新渠道检查，不会创建或修改业务数据文件。
