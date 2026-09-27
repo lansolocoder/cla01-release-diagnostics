@@ -13,6 +13,35 @@ from . import __version__
 INFO_PLIST_PATH = "Contents/Info.plist"
 
 LC_LOAD_DYLIB = 0x0C
+LC_CODE_SIGNATURE = 0x1D
+
+# Embedded code-signature blobs are always stored big-endian ("network" order).
+CSMAGIC_EMBEDDED_SIGNATURE = 0xFADE0CC0
+CSMAGIC_CODEDIRECTORY = 0xFADE0C02
+CS_VERSION_SUPPORTS_TEAM_ID = 0x00020200
+CSSLOT_CODEDIRECTORY = 0x00000
+CSSLOT_ALTERNATE_CODEDIRECTORIES = 0x1000
+CSSLOT_ALTERNATE_CODEDIRECTORY_MAX = 5
+
+# Index-table slot types (csslot_type in cs_blobs.h) -> report names.
+CS_SLOT_TYPE_NAMES = {
+    0x00000: "CodeDirectory",
+    0x00001: "InfoSlot",
+    0x00002: "RequirementsSlot",
+    0x00003: "ResourceDir",
+    0x00004: "ApplicationSlot",
+    0x00005: "EntitlementsSlot",
+    0x00007: "DEREntitlementsSlot",
+    0x10000: "SignatureSlot",
+    0x10001: "IdentificationSlot",
+    0x10002: "TicketSlot",
+}
+
+CS_SUPERBLOB_HEADER_SIZE = 12
+CS_BLOB_INDEX_SIZE = 8
+CS_BLOB_HEADER_SIZE = 8
+CS_CODEDIRECTORY_HEADER_SIZE = 44
+CS_CODEDIRECTORY_TEAM_OFFSET = 48
 
 # Raw magic bytes -> (bits, endian, architecture label).
 MACHO_MAGICS = {
@@ -32,6 +61,10 @@ class AppInfoError(Exception):
 
 class MachoInfoError(Exception):
     """Diagnostic failure for a ``macho-info`` invocation."""
+
+
+class SignInfoError(Exception):
+    """Diagnostic failure for a ``sign-info`` invocation."""
 
 
 def _collect_app_info(app_arg: str) -> dict:
@@ -198,6 +231,232 @@ def _collect_macho_info(app_arg: str) -> dict:
     return {"architectures": sorted(architectures), "binaries": binaries}
 
 
+def _find_code_signature(
+    file_path: str, data: bytes, bits: int, byteorder: str
+) -> tuple[int, int] | None:
+    """Locate the ``LC_CODE_SIGNATURE`` payload, returning (offset, size)."""
+    header_size = MACHO_HEADER_SIZE[bits]
+    ncmds = int.from_bytes(data[16:20], byteorder)
+    offset = header_size
+    for _ in range(ncmds):
+        if offset + 8 > len(data):
+            raise SignInfoError(
+                f"{file_path}: load command extends past end of file"
+            )
+        cmd = int.from_bytes(data[offset : offset + 4], byteorder)
+        cmdsize = int.from_bytes(data[offset + 4 : offset + 8], byteorder)
+        if cmdsize < 8:
+            raise SignInfoError(
+                f"{file_path}: load command size smaller than command header"
+            )
+        if offset + cmdsize > len(data):
+            raise SignInfoError(
+                f"{file_path}: load command extends past end of file"
+            )
+        if cmd == LC_CODE_SIGNATURE:
+            if cmdsize < 16:
+                raise SignInfoError(
+                    f"{file_path}: code signature command size smaller than header"
+                )
+            sig_offset = int.from_bytes(data[offset + 8 : offset + 12], byteorder)
+            sig_size = int.from_bytes(data[offset + 12 : offset + 16], byteorder)
+            return sig_offset, sig_size
+        offset += cmdsize
+    return None
+
+
+def _read_blob_cstring(
+    file_path: str, blob: bytes, base: int, blob_length: int, field: str
+) -> str | None:
+    """Read a NUL-terminated string at ``base`` within a signature blob."""
+    if base == 0:
+        return None
+    if base < 0 or base >= blob_length:
+        raise SignInfoError(f"{file_path}: code signature {field} offset out of range")
+    end = blob.find(b"\0", base, blob_length)
+    if end < 0:
+        raise SignInfoError(
+            f"{file_path}: code signature {field} is not NUL-terminated"
+        )
+    return blob[base:end].decode("utf-8", "surrogateescape")
+
+
+def _parse_code_signature(
+    file_path: str, data: bytes, sig_offset: int, sig_size: int
+) -> dict:
+    """Parse the embedded-signature SuperBlob located at ``sig_offset``."""
+    # The load command reserves ``sig_size`` bytes (16-byte aligned); the
+    # SuperBlob's own length field is authoritative for the directory content.
+    if sig_offset < 0 or sig_size < 0 or sig_offset + sig_size > len(data):
+        raise SignInfoError(
+            f"{file_path}: code signature data extends past end of file"
+        )
+
+    if sig_size < CS_SUPERBLOB_HEADER_SIZE:
+        raise SignInfoError(
+            f"{file_path}: code signature directory extends past end of file"
+        )
+    magic = int.from_bytes(data[sig_offset : sig_offset + 4], "big")
+    if magic != CSMAGIC_EMBEDDED_SIGNATURE:
+        raise SignInfoError(
+            f"{file_path}: code signature directory has non-embedded magic"
+        )
+    length = int.from_bytes(data[sig_offset + 4 : sig_offset + 8], "big")
+    if length < CS_SUPERBLOB_HEADER_SIZE or length > sig_size:
+        raise SignInfoError(
+            f"{file_path}: code signature directory length does not match payload"
+        )
+
+    blob = data[sig_offset : sig_offset + length]
+    count = int.from_bytes(blob[8:12], "big")
+    index_end = CS_SUPERBLOB_HEADER_SIZE + count * CS_BLOB_INDEX_SIZE
+    if index_end > length:
+        raise SignInfoError(
+            f"{file_path}: code signature index table extends past directory"
+        )
+
+    entry_names: set[str] = set()
+    code_directory: bytes | None = None
+    for index in range(count):
+        entry_offset_pos = CS_SUPERBLOB_HEADER_SIZE + index * CS_BLOB_INDEX_SIZE
+        slot_type = int.from_bytes(
+            blob[entry_offset_pos : entry_offset_pos + 4], "big"
+        )
+        slot_offset = int.from_bytes(
+            blob[entry_offset_pos + 4 : entry_offset_pos + 8], "big"
+        )
+        if (
+            slot_offset < CS_SUPERBLOB_HEADER_SIZE
+            or slot_offset + CS_BLOB_HEADER_SIZE > length
+        ):
+            raise SignInfoError(
+                f"{file_path}: code signature slot offset out of range"
+            )
+        slot_length = int.from_bytes(
+            blob[slot_offset + 4 : slot_offset + 8], "big"
+        )
+        if slot_length < CS_BLOB_HEADER_SIZE or slot_offset + slot_length > length:
+            raise SignInfoError(
+                f"{file_path}: code signature slot extends past directory"
+            )
+        if slot_type == CSSLOT_CODEDIRECTORY:
+            code_directory = blob[slot_offset : slot_offset + slot_length]
+        if (
+            slot_type == CSSLOT_CODEDIRECTORY
+            or CSSLOT_ALTERNATE_CODEDIRECTORIES
+            <= slot_type
+            < CSSLOT_ALTERNATE_CODEDIRECTORIES + CSSLOT_ALTERNATE_CODEDIRECTORY_MAX
+        ):
+            entry_names.add("CodeDirectory")
+        else:
+            entry_names.add(
+                CS_SLOT_TYPE_NAMES.get(slot_type, f"0x{slot_type:05x}")
+            )
+
+    if code_directory is None:
+        raise SignInfoError(
+            f"{file_path}: code signature directory lacks a CodeDirectory slot"
+        )
+    if len(code_directory) < CS_CODEDIRECTORY_HEADER_SIZE:
+        raise SignInfoError(
+            f"{file_path}: code directory extends past end of file"
+        )
+    if (
+        int.from_bytes(code_directory[0:4], "big") != CSMAGIC_CODEDIRECTORY
+    ):
+        raise SignInfoError(f"{file_path}: code directory has invalid magic")
+
+    version = int.from_bytes(code_directory[8:12], "big")
+    cd_length = int.from_bytes(code_directory[4:8], "big")
+    if cd_length != len(code_directory):
+        raise SignInfoError(
+            f"{file_path}: code directory length does not match slot"
+        )
+    ident_offset = int.from_bytes(code_directory[20:24], "big")
+    identifier = _read_blob_cstring(
+        file_path, code_directory, ident_offset, cd_length, "identifier"
+    )
+
+    team_id: str | None = None
+    if version >= CS_VERSION_SUPPORTS_TEAM_ID:
+        if cd_length < CS_CODEDIRECTORY_TEAM_OFFSET + 4:
+            raise SignInfoError(
+                f"{file_path}: code directory too short for team identifier"
+            )
+        team_offset = int.from_bytes(
+            code_directory[CS_CODEDIRECTORY_TEAM_OFFSET : CS_CODEDIRECTORY_TEAM_OFFSET + 4],
+            "big",
+        )
+        team_id = _read_blob_cstring(
+            file_path, code_directory, team_offset, cd_length, "team identifier"
+        )
+
+    return {
+        "identifier": identifier,
+        "team_id": team_id,
+        "entries": sorted(entry_names),
+    }
+
+
+def _collect_sign_info(app_arg: str) -> dict:
+    """Inspect embedded code signatures of Mach-O binaries in a bundle."""
+    app_path = app_arg  # keep the user-supplied spelling in diagnostics
+    app = Path(app_arg)
+
+    if not app.exists():
+        raise SignInfoError(f"{app_path}: path does not exist")
+    if not app.is_dir():
+        raise SignInfoError(f"{app_path}: not a directory")
+    if not app.name.endswith(".app"):
+        raise SignInfoError(f"{app_path}: bundle name must end with .app")
+
+    contents = app / "Contents"
+    if not contents.is_dir():
+        raise SignInfoError(f"{app_path}: missing Contents directory")
+
+    binaries = []
+    unsigned_binaries = []
+    for subdir in ("MacOS", "Resources"):
+        root = contents / subdir
+        if root.is_symlink() or not root.is_dir():
+            continue
+        for file_path in _iter_bundle_files(str(root)):
+            try:
+                with open(file_path, "rb") as handle:
+                    data = handle.read()
+            except OSError as exc:
+                raise SignInfoError(f"{file_path}: cannot read file ({exc})") from exc
+            if data[:4] not in MACHO_MAGICS:
+                continue
+            bits, endian, _arch = MACHO_MAGICS[data[:4]]
+            byteorder = "little" if endian == "little" else "big"
+            if len(data) < MACHO_HEADER_SIZE[bits]:
+                raise SignInfoError(f"{file_path}: truncated Mach-O header")
+            relative = os.path.relpath(file_path, app).replace(os.sep, "/")
+            signature = _find_code_signature(file_path, data, bits, byteorder)
+            if signature is None:
+                binaries.append(
+                    {
+                        "path": relative,
+                        "status": "unsigned",
+                        "identifier": None,
+                        "team_id": None,
+                        "entries": [],
+                    }
+                )
+                unsigned_binaries.append(relative)
+                continue
+            details = _parse_code_signature(file_path, data, *signature)
+            binaries.append({"path": relative, "status": "signed", **details})
+
+    binaries.sort(key=lambda item: item["path"])
+    unsigned_binaries.sort()
+    return {
+        "binaries": binaries,
+        "unsigned_binaries": unsigned_binaries,
+    }
+
+
 def _collect_apps_diff(old_arg: str, new_arg: str) -> dict:
     """Compare two ``.app`` bundles using the app-info/macho-info rules."""
     # Validate and inspect the old bundle fully before touching the new one.
@@ -268,6 +527,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     diff_parser.add_argument("old_app", help="path to the old .app bundle directory")
     diff_parser.add_argument("new_app", help="path to the new .app bundle directory")
 
+    sign_info_parser = subparsers.add_parser(
+        "sign-info",
+        help="Inspect embedded code signatures of Mach-O binaries in a .app bundle.",
+    )
+    sign_info_parser.add_argument("app", help="path to the .app bundle directory")
+
     args = parser.parse_args(argv)
 
     if args.command is None:
@@ -296,6 +561,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             report = _collect_apps_diff(args.old_app, args.new_app)
         except (AppInfoError, MachoInfoError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps(report))
+        return 0
+
+    if args.command == "sign-info":
+        try:
+            report = _collect_sign_info(args.app)
+        except SignInfoError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
         print(json.dumps(report))

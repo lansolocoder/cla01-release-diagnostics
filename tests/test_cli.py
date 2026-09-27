@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 import plistlib
+import struct
 import subprocess
 import sys
 import tempfile
@@ -231,6 +232,405 @@ def _macho(magic: bytes, commands: list[bytes]) -> bytes:
     header[16:20] = len(commands).to_bytes(4, byteorder)
     header[20:24] = sum(len(command) for command in commands).to_bytes(4, byteorder)
     return bytes(header) + b"".join(commands)
+
+
+LC_CODE_SIGNATURE = 0x1D
+CSMAGIC_EMBEDDED_SIGNATURE = 0xFADE0CC0
+CSMAGIC_CODEDIRECTORY = 0xFADE0C02
+
+
+def _cs_blob(magic: int, payload: bytes = b"") -> bytes:
+    return struct.pack(">II", magic, 8 + len(payload)) + payload
+
+
+def _code_directory(
+    identifier: str, team_id: str | None = None, version: int = 0x00020400
+) -> bytes:
+    ident = identifier.encode() + b"\0"
+    team = b""
+    header_size = 44
+    team_offset = 0
+    if team_id is not None or version >= 0x00020200:
+        header_size = 52
+    if team_id is not None:
+        team = team_id.encode() + b"\0"
+        team_offset = header_size + len(ident)
+    total = header_size + len(ident) + len(team)
+    cd = bytearray(total)
+    struct.pack_into(">I", cd, 0, CSMAGIC_CODEDIRECTORY)
+    struct.pack_into(">I", cd, 4, total)
+    struct.pack_into(">I", cd, 8, version)
+    struct.pack_into(">I", cd, 16, total)  # hashOffset
+    struct.pack_into(">I", cd, 20, header_size)  # identOffset
+    cd[header_size : header_size + len(ident)] = ident
+    if team_id is not None:
+        struct.pack_into(">I", cd, 48, team_offset)
+        cd[team_offset : team_offset + len(team)] = team
+    return bytes(cd)
+
+
+def _code_directory_with_fields(
+    identifier: str, fields: list[tuple[int, int]]
+) -> bytes:
+    """Build a CodeDirectory whose fixed-offset fields are overridden."""
+    cd = bytearray(_code_directory(identifier))
+    for offset, value in fields:
+        struct.pack_into(">I", cd, offset, value)
+    return bytes(cd)
+
+
+def _superblob(entries: list[tuple[int, bytes]]) -> bytes:
+    entries = sorted(entries)
+    index_size = 12 + 8 * len(entries)
+    index = b""
+    blobs = b""
+    for slot, blob in entries:
+        index += struct.pack(">II", slot, index_size + len(blobs))
+        blobs += blob
+    return (
+        struct.pack(">III", CSMAGIC_EMBEDDED_SIGNATURE, index_size + len(blobs), len(entries))
+        + index
+        + blobs
+    )
+
+
+def _lc_code_signature(sig_offset: int, sig_size: int) -> bytes:
+    return struct.pack("<IIII", LC_CODE_SIGNATURE, 16, sig_offset, sig_size)
+
+
+def _signed_binary(signature: bytes, sig_size: int | None = None) -> bytes:
+    """64-bit little-endian Mach-O carrying ``signature`` right after commands."""
+    size = len(signature) if sig_size is None else sig_size
+    header = bytearray(32)
+    header[0:4] = MAGIC_64_LE
+    header[16:20] = (1).to_bytes(4, "little")  # ncmds
+    header[20:24] = (16).to_bytes(4, "little")  # sizeofcmds
+    # Header (32) + command (16) = 48, which is 16-byte aligned.
+    return (
+        bytes(header)
+        + _lc_code_signature(48, size)
+        + signature
+        + b"\0" * (size - len(signature))
+    )
+
+
+class SignInfoTests(unittest.TestCase):
+    def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "release_workbench", "sign-info", *arguments],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def make_bundle(self, tmp: str, name: str = "Example.app") -> Path:
+        app = Path(tmp) / name
+        (app / "Contents" / "MacOS").mkdir(parents=True)
+        (app / "Contents" / "Resources").mkdir()
+        return app
+
+    def assert_sign_error(self, app: Path, failing_file: Path) -> None:
+        result = self.invoke(str(app))
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertEqual(result.stdout, "")
+        self.assertIn(str(failing_file), result.stderr)
+
+    def test_signed_and_unsigned_binaries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_bundle(tmp)
+            signed = _superblob(
+                [
+                    (0, _code_directory("com.example.App", "ABCD123456")),
+                    (0x10000, _cs_blob(0xFADE0B01, b"cms")),
+                ]
+            )
+            (app / "Contents" / "MacOS" / "App").write_bytes(_signed_binary(signed))
+            (app / "Contents" / "MacOS" / "Tool").write_bytes(_macho(MAGIC_64_LE, []))
+            (app / "Contents" / "Resources" / "notes").write_text("not mach-o")
+            result = self.invoke(str(app))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(result.stdout.count("\n"), 1)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "binaries": [
+                    {
+                        "path": "Contents/MacOS/App",
+                        "status": "signed",
+                        "identifier": "com.example.App",
+                        "team_id": "ABCD123456",
+                        "entries": ["CodeDirectory", "SignatureSlot"],
+                    },
+                    {
+                        "path": "Contents/MacOS/Tool",
+                        "status": "unsigned",
+                        "identifier": None,
+                        "team_id": None,
+                        "entries": [],
+                    },
+                ],
+                "unsigned_binaries": ["Contents/MacOS/Tool"],
+            },
+        )
+
+    def test_signed_without_team_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_bundle(tmp)
+            signature = _superblob(
+                [(0, _code_directory("com.example.Helper", version=0x00020100))]
+            )
+            (app / "Contents" / "MacOS" / "Helper").write_bytes(
+                _signed_binary(signature)
+            )
+            result = self.invoke(str(app))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = json.loads(result.stdout)["binaries"][0]
+        self.assertEqual(entry["status"], "signed")
+        self.assertEqual(entry["identifier"], "com.example.Helper")
+        self.assertIsNone(entry["team_id"])
+        self.assertEqual(entry["entries"], ["CodeDirectory"])
+
+    def test_entries_deduplicated_and_sorted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_bundle(tmp)
+            # Slots 0 and 0x1000 are both CodeDirectory slots.
+            signature = _superblob(
+                [
+                    (0x10000, _cs_blob(0xFADE0B01, b"cms")),
+                    (0x1000, _code_directory("com.example.App")),
+                    (0x5, _cs_blob(0xFADE7171, b"ent")),
+                    (0, _code_directory("com.example.App")),
+                ]
+            )
+            (app / "Contents" / "MacOS" / "App").write_bytes(_signed_binary(signature))
+            result = self.invoke(str(app))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = json.loads(result.stdout)["binaries"][0]
+        self.assertEqual(
+            entry["entries"],
+            ["CodeDirectory", "EntitlementsSlot", "SignatureSlot"],
+        )
+
+    def test_reserved_lc_region_larger_than_directory(self) -> None:
+        # Real linkedit commands reserve 16-byte-aligned space; the
+        # SuperBlob length is smaller than the LC data size.
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_bundle(tmp)
+            signature = _superblob([(0, _code_directory("com.example.App"))])
+            binary = _signed_binary(signature, sig_size=len(signature) + 16)
+            (app / "Contents" / "MacOS" / "App").write_bytes(binary)
+            result = self.invoke(str(app))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout)["binaries"][0]["status"], "signed"
+        )
+
+    def test_recurses_into_subdirectories_and_skips_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_bundle(tmp)
+            signature = _superblob([(0, _code_directory("com.example.Lib"))])
+            nested = app / "Contents" / "Resources" / "Frameworks" / "Deep"
+            nested.mkdir(parents=True)
+            (nested / "Lib").write_bytes(_signed_binary(signature))
+            target = Path(tmp) / "outside"
+            target.write_bytes(_signed_binary(signature))
+            (app / "Contents" / "MacOS" / "Link").symlink_to(target)
+            result = self.invoke(str(app))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(
+            [entry["path"] for entry in report["binaries"]],
+            ["Contents/Resources/Frameworks/Deep/Lib"],
+        )
+        self.assertEqual(report["unsigned_binaries"], [])
+
+    def test_no_macho_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_bundle(tmp)
+            (app / "Contents" / "MacOS" / "script").write_text("#!/bin/sh\n")
+            result = self.invoke(str(app))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {"binaries": [], "unsigned_binaries": []},
+        )
+
+    def test_all_unsigned_exit_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_bundle(tmp)
+            (app / "Contents" / "MacOS" / "A").write_bytes(_macho(MAGIC_64_LE, []))
+            (app / "Contents" / "Resources" / "B").write_bytes(_macho(MAGIC_32_BE, []))
+            result = self.invoke(str(app))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(
+            report["unsigned_binaries"],
+            ["Contents/MacOS/A", "Contents/Resources/B"],
+        )
+        self.assertTrue(
+            all(entry["status"] == "unsigned" for entry in report["binaries"])
+        )
+
+    def test_signature_offset_past_end_of_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_bundle(tmp)
+            binary = app / "Contents" / "MacOS" / "Bad"
+            binary.write_bytes(
+                _macho(MAGIC_64_LE, [_lc_code_signature(9999, 100)])
+            )
+            self.assert_sign_error(app, binary)
+
+    def test_signature_size_past_end_of_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_bundle(tmp)
+            signature = _superblob([(0, _code_directory("com.example.App"))])
+            binary = app / "Contents" / "MacOS" / "Bad"
+            binary.write_bytes(
+                _macho(
+                    MAGIC_64_LE,
+                    [_lc_code_signature(48, 99999), signature],
+                )
+            )
+            self.assert_sign_error(app, binary)
+
+    def test_directory_magic_is_not_embedded_signature(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_bundle(tmp)
+            signature = bytearray(
+                _superblob([(0, _code_directory("com.example.App"))])
+            )
+            signature[0:4] = b"\x00\x00\x00\x00"
+            binary = app / "Contents" / "MacOS" / "Bad"
+            binary.write_bytes(_signed_binary(bytes(signature)))
+            self.assert_sign_error(app, binary)
+
+    def test_directory_length_does_not_match_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_bundle(tmp)
+            signature = bytearray(
+                _superblob([(0, _code_directory("com.example.App"))])
+            )
+            struct.pack_into(">I", signature, 4, len(signature) + 100)
+            binary = app / "Contents" / "MacOS" / "Bad"
+            binary.write_bytes(_signed_binary(bytes(signature)))
+            self.assert_sign_error(app, binary)
+
+    def test_index_table_extends_past_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_bundle(tmp)
+            signature = bytearray(
+                _superblob([(0, _code_directory("com.example.App"))])
+            )
+            struct.pack_into(">I", signature, 8, 100000)
+            binary = app / "Contents" / "MacOS" / "Bad"
+            binary.write_bytes(_signed_binary(bytes(signature)))
+            self.assert_sign_error(app, binary)
+
+    def test_slot_offset_out_of_range(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_bundle(tmp)
+            signature = (
+                struct.pack(">III", CSMAGIC_EMBEDDED_SIGNATURE, 64, 1)
+                + struct.pack(">II", 0x10000, 9999)
+                + b"\0" * 36
+            )
+            binary = app / "Contents" / "MacOS" / "Bad"
+            binary.write_bytes(_signed_binary(signature))
+            self.assert_sign_error(app, binary)
+
+    def test_slot_extends_past_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_bundle(tmp)
+            cd = bytearray(_code_directory("com.example.App"))
+            struct.pack_into(">I", cd, 4, 99999)  # corrupt slot length
+            signature = _superblob([(0, bytes(cd))])
+            binary = app / "Contents" / "MacOS" / "Bad"
+            binary.write_bytes(_signed_binary(signature))
+            self.assert_sign_error(app, binary)
+
+    def test_missing_code_directory_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_bundle(tmp)
+            signature = _superblob(
+                [(0x10000, _cs_blob(0xFADE0B01, b"cms"))]
+            )
+            binary = app / "Contents" / "MacOS" / "Bad"
+            binary.write_bytes(_signed_binary(signature))
+            self.assert_sign_error(app, binary)
+
+    def test_code_directory_magic_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_bundle(tmp)
+            signature = _superblob(
+                [(0, _cs_blob(0xFADE0C01, b"\0" * 40))]
+            )
+            binary = app / "Contents" / "MacOS" / "Bad"
+            binary.write_bytes(_signed_binary(signature))
+            self.assert_sign_error(app, binary)
+
+    def test_identifier_offset_out_of_range(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_bundle(tmp)
+            cd = _code_directory_with_fields("com.example.App", [(20, 9999)])
+            signature = _superblob([(0, cd)])
+            binary = app / "Contents" / "MacOS" / "Bad"
+            binary.write_bytes(_signed_binary(signature))
+            self.assert_sign_error(app, binary)
+
+    def test_truncated_macho_header(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_bundle(tmp)
+            binary = app / "Contents" / "MacOS" / "Short"
+            binary.write_bytes(MAGIC_64_LE + b"\x00" * 4)
+            self.assert_sign_error(app, binary)
+
+    def test_path_does_not_exist(self) -> None:
+        result = self.invoke("/nonexistent/Nope.app")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("/nonexistent/Nope.app", result.stderr)
+
+    def test_not_a_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = Path(tmp) / "File.app"
+            app.write_text("not a bundle")
+            result = self.invoke(str(app))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn(str(app), result.stderr)
+
+    def test_name_not_app_suffix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = Path(tmp) / "Example"
+            (bundle / "Contents").mkdir(parents=True)
+            result = self.invoke(str(bundle))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn(str(bundle), result.stderr)
+
+    def test_missing_contents_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = Path(tmp) / "NoContents.app"
+            app.mkdir()
+            result = self.invoke(str(app))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn(str(app), result.stderr)
+
+    def test_extra_option_is_an_error(self) -> None:
+        result = self.invoke("Example.app", "--bogus")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("--bogus", result.stderr)
 
 
 class MachoInfoTests(unittest.TestCase):
