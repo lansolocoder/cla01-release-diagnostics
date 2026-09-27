@@ -1069,5 +1069,209 @@ class DiffAppsTests(unittest.TestCase):
             self.assertIn(str(bad), result.stderr)
 
 
+class DepCheckTests(unittest.TestCase):
+    def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "release_workbench", "dep-check", *arguments],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def make_bundle(self, tmp: str, name: str = "Example.app") -> Path:
+        app = Path(tmp) / name
+        (app / "Contents" / "MacOS").mkdir(parents=True)
+        (app / "Contents" / "Resources").mkdir()
+        return app
+
+    def test_ok_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_bundle(tmp)
+            present = Path(tmp) / "libpresent.dylib"
+            present.write_bytes(b"dylib")
+            (app / "Contents" / "MacOS" / "App").write_bytes(
+                _macho(
+                    MAGIC_64_LE,
+                    [
+                        _dylib_command(b"/usr/lib/libSystem.B.dylib"),
+                        _dylib_command(str(present).encode()),
+                    ],
+                )
+            )
+            result = self.invoke(str(app), "x86_64")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(result.stdout.count("\n"), 1)
+        report = json.loads(result.stdout)
+        self.assertEqual(
+            report,
+            {
+                "target_arch": "x86_64",
+                "missing_arch_binaries": [],
+                "external_dylibs": sorted(
+                    ["/usr/lib/libSystem.B.dylib", str(present)]
+                ),
+                "missing_dylibs": [],
+                "unresolved_dylibs": [],
+                "status": "ok",
+            },
+        )
+
+    def test_missing_deps_status_and_priority(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_bundle(tmp)
+            # A ppc binary (would mismatch x86_64) plus a missing host dylib:
+            # missing-deps must win over arch-mismatch.
+            (app / "Contents" / "MacOS" / "Helper").write_bytes(
+                _macho(
+                    MAGIC_32_BE,
+                    [
+                        _dylib_command(
+                            b"/opt/local/lib/libssl.dylib", byteorder="big"
+                        ),
+                        _dylib_command(
+                            b"/opt/local/lib/libssl.dylib", byteorder="big"
+                        ),
+                        _dylib_command(
+                            b"/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation",
+                            byteorder="big",
+                        ),
+                    ],
+                )
+            )
+            result = self.invoke(str(app), "x86_64")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["missing_dylibs"], ["/opt/local/lib/libssl.dylib"])
+        self.assertEqual(
+            report["external_dylibs"],
+            [
+                "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation",
+                "/opt/local/lib/libssl.dylib",
+            ],
+        )
+        self.assertEqual(
+            report["missing_arch_binaries"], ["Contents/MacOS/Helper"]
+        )
+        self.assertEqual(report["status"], "missing-deps")
+
+    def test_arch_mismatch_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_bundle(tmp)
+            (app / "Contents" / "MacOS" / "Main").write_bytes(
+                _macho(MAGIC_64_LE, [_dylib_command(b"/usr/lib/libSystem.B.dylib")])
+            )
+            (app / "Contents" / "Resources" / "Helper").write_bytes(
+                _macho(MAGIC_32_BE, [])
+            )
+            result = self.invoke(str(app), "x86_64")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(
+            report["missing_arch_binaries"], ["Contents/Resources/Helper"]
+        )
+        self.assertEqual(report["status"], "arch-mismatch")
+
+    def test_unresolved_and_bundle_frameworks_excluded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_bundle(tmp)
+            fw_dir = app / "Contents" / "Frameworks"
+            fw_dir.mkdir(parents=True)
+            bundled = fw_dir / "libFW.dylib"
+            bundled.write_bytes(b"macho")
+            (app / "Contents" / "MacOS" / "App").write_bytes(
+                _macho(
+                    MAGIC_64_LE,
+                    [
+                        _dylib_command(b"@rpath/libPlug.dylib"),
+                        _dylib_command(b"@executable_path/../Frameworks/libX.dylib"),
+                        _dylib_command(str(bundled).encode()),
+                    ],
+                )
+            )
+            result = self.invoke(str(app), "x86_64")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(
+            report["unresolved_dylibs"],
+            ["@executable_path/../Frameworks/libX.dylib", "@rpath/libPlug.dylib"],
+        )
+        self.assertEqual(report["external_dylibs"], [])
+        self.assertEqual(report["missing_dylibs"], [])
+        self.assertEqual(report["status"], "ok")
+
+    def test_no_macho_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_bundle(tmp)
+            (app / "Contents" / "MacOS" / "script").write_text("#!/bin/sh\n")
+            for arch in ("i386", "ppc", "x86_64", "ppc64"):
+                result = self.invoke(str(app), arch)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                report = json.loads(result.stdout)
+                self.assertEqual(report["target_arch"], arch)
+                self.assertEqual(
+                    report,
+                    {
+                        "target_arch": arch,
+                        "missing_arch_binaries": [],
+                        "external_dylibs": [],
+                        "missing_dylibs": [],
+                        "unresolved_dylibs": [],
+                        "status": "ok",
+                    },
+                )
+
+    def test_invalid_architecture_label(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_bundle(tmp)
+            result = self.invoke(str(app), "arm64")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("arm64", result.stderr)
+
+    def test_malformed_macho_fails_with_partial_results_suppressed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_bundle(tmp)
+            bad = app / "Contents" / "MacOS" / "Bad"
+            bad.write_bytes(MAGIC_64_LE + b"\x00" * 4)
+            result = self.invoke(str(app), "x86_64")
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertEqual(result.stdout, "")
+        self.assertIn(str(bad), result.stderr)
+
+    def test_bundle_validation_errors(self) -> None:
+        result = self.invoke("/nonexistent/Nope.app", "x86_64")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("/nonexistent/Nope.app", result.stderr)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            app = Path(tmp) / "File.app"
+            app.write_text("not a bundle")
+            result = self.invoke(str(app), "x86_64")
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.stdout, "")
+            self.assertIn(str(app), result.stderr)
+
+            bundle = Path(tmp) / "Example"
+            (bundle / "Contents").mkdir(parents=True)
+            result = self.invoke(str(bundle), "x86_64")
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.stdout, "")
+            self.assertIn(str(bundle), result.stderr)
+
+            no_contents = Path(tmp) / "NoContents.app"
+            no_contents.mkdir()
+            result = self.invoke(str(no_contents), "x86_64")
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.stdout, "")
+            self.assertIn(str(no_contents), result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

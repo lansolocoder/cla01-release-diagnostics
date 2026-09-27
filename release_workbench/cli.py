@@ -54,6 +54,9 @@ MACHO_MAGICS = {
 MACHO_HEADER_SIZE = {32: 28, 64: 32}
 DYLIB_COMMAND_HEADER_SIZE = 24
 
+# Architecture labels accepted by ``dep-check`` (same labels as macho-info).
+TARGET_ARCH_LABELS = tuple(sorted(spec[2] for spec in MACHO_MAGICS.values()))
+
 
 class AppInfoError(Exception):
     """Diagnostic failure for an ``app-info`` invocation."""
@@ -65,6 +68,10 @@ class MachoInfoError(Exception):
 
 class SignInfoError(Exception):
     """Diagnostic failure for a ``sign-info`` invocation."""
+
+
+class DepCheckError(Exception):
+    """Diagnostic failure for a ``dep-check`` invocation."""
 
 
 def _collect_app_info(app_arg: str) -> dict:
@@ -457,6 +464,89 @@ def _collect_sign_info(app_arg: str) -> dict:
     }
 
 
+def _collect_dep_check(app_arg: str, target_arch: str) -> dict:
+    """Check linked dylib availability and architecture of bundle binaries."""
+    if target_arch not in TARGET_ARCH_LABELS:
+        raise DepCheckError(
+            f"{target_arch}: unknown architecture label "
+            f"(expected one of {', '.join(TARGET_ARCH_LABELS)})"
+        )
+
+    app_path = app_arg  # keep the user-supplied spelling in diagnostics
+    app = Path(app_arg)
+
+    if not app.exists():
+        raise DepCheckError(f"{app_path}: path does not exist")
+    if not app.is_dir():
+        raise DepCheckError(f"{app_path}: not a directory")
+    if not app.name.endswith(".app"):
+        raise DepCheckError(f"{app_path}: bundle name must end with .app")
+
+    contents = app / "Contents"
+    if not contents.is_dir():
+        raise DepCheckError(f"{app_path}: missing Contents directory")
+
+    missing_arch_binaries: set[str] = set()
+    unresolved_dylibs: set[str] = set()
+    external_dylibs: set[str] = set()
+    frameworks_dir = os.path.abspath(os.path.join(app, "Contents", "Frameworks"))
+    for subdir in ("MacOS", "Resources"):
+        root = contents / subdir
+        if root.is_symlink() or not root.is_dir():
+            continue
+        for file_path in _iter_bundle_files(str(root)):
+            try:
+                with open(file_path, "rb") as handle:
+                    data = handle.read()
+            except OSError as exc:
+                raise DepCheckError(f"{file_path}: cannot read file ({exc})") from exc
+            if data[:4] not in MACHO_MAGICS:
+                continue
+            relative = os.path.relpath(file_path, app).replace(os.sep, "/")
+            try:
+                parsed = _parse_macho_file(file_path, data)
+            except MachoInfoError as exc:
+                raise DepCheckError(str(exc)) from exc
+            if parsed["arch"] != target_arch:
+                missing_arch_binaries.add(relative)
+            for name in parsed["entry"]["dylibs"]:
+                if name.startswith("@"):
+                    unresolved_dylibs.add(name)
+                    continue
+                referenced = name if os.path.isabs(name) else os.path.join(app, name)
+                if os.path.abspath(referenced).startswith(
+                    frameworks_dir + os.sep
+                ):
+                    # Points inside the bundle's Contents/Frameworks directory.
+                    continue
+                if name.startswith("/"):
+                    external_dylibs.add(name)
+                # Other relative (non-@) names are not host absolute paths and
+                # are neither external nor unresolved.
+
+    missing_dylibs = sorted(
+        name
+        for name in external_dylibs
+        if not name.startswith(("/usr/lib/", "/System/")) and not os.path.exists(name)
+    )
+
+    if missing_dylibs:
+        status = "missing-deps"
+    elif missing_arch_binaries:
+        status = "arch-mismatch"
+    else:
+        status = "ok"
+
+    return {
+        "target_arch": target_arch,
+        "missing_arch_binaries": sorted(missing_arch_binaries),
+        "external_dylibs": sorted(external_dylibs),
+        "missing_dylibs": missing_dylibs,
+        "unresolved_dylibs": sorted(unresolved_dylibs),
+        "status": status,
+    }
+
+
 def _collect_apps_diff(old_arg: str, new_arg: str) -> dict:
     """Compare two ``.app`` bundles using the app-info/macho-info rules."""
     # Validate and inspect the old bundle fully before touching the new one.
@@ -533,6 +623,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     sign_info_parser.add_argument("app", help="path to the .app bundle directory")
 
+    dep_check_parser = subparsers.add_parser(
+        "dep-check",
+        help="Check linked dylib availability and binary architecture in a bundle.",
+    )
+    dep_check_parser.add_argument("app", help="path to the .app bundle directory")
+    dep_check_parser.add_argument(
+        "arch",
+        choices=TARGET_ARCH_LABELS,
+        help="target architecture label (i386, ppc, x86_64 or ppc64)",
+    )
+
     args = parser.parse_args(argv)
 
     if args.command is None:
@@ -570,6 +671,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             report = _collect_sign_info(args.app)
         except SignInfoError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps(report))
+        return 0
+
+    if args.command == "dep-check":
+        try:
+            report = _collect_dep_check(args.app, args.arch)
+        except DepCheckError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
         print(json.dumps(report))
