@@ -4,9 +4,11 @@ import argparse
 import json
 import os
 import plistlib
+import re
 import sys
 from collections.abc import Sequence
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from . import __version__
 
@@ -72,6 +74,10 @@ class SignInfoError(Exception):
 
 class DepCheckError(Exception):
     """Diagnostic failure for a ``dep-check`` invocation."""
+
+
+class UpdateCheckError(Exception):
+    """Diagnostic failure for an ``update-check`` invocation."""
 
 
 def _collect_app_info(app_arg: str) -> dict:
@@ -547,6 +553,79 @@ def _collect_dep_check(app_arg: str, target_arch: str) -> dict:
     }
 
 
+VERSION_SEGMENT_PATTERN = re.compile(r"[0-9]+")
+
+
+def _collect_update_check(app_arg: str) -> dict:
+    """Statically inspect the update-channel configuration of a bundle."""
+    app_path = app_arg  # keep the user-supplied spelling in diagnostics
+    app = Path(app_arg)
+
+    if not app.exists():
+        raise UpdateCheckError(f"{app_path}: path does not exist")
+    if not app.is_dir():
+        raise UpdateCheckError(f"{app_path}: not a directory")
+    if not app.name.endswith(".app"):
+        raise UpdateCheckError(f"{app_path}: bundle name must end with .app")
+
+    contents = app / "Contents"
+    if not contents.is_dir():
+        raise UpdateCheckError(f"{app_path}: missing Contents directory")
+
+    plist_file = contents / "Info.plist"
+    if not plist_file.exists():
+        raise UpdateCheckError(f"{plist_file}: missing Info.plist")
+    try:
+        plist_data = plistlib.loads(plist_file.read_bytes())
+    except Exception as exc:
+        raise UpdateCheckError(
+            f"{plist_file}: invalid property list ({exc})"
+        ) from exc
+    if not isinstance(plist_data, dict):
+        raise UpdateCheckError(
+            f"{plist_file}: property list root object is not a dictionary"
+        )
+
+    feed_url = plist_data.get("SUFeedURL")
+    channel_url = feed_url if isinstance(feed_url, str) else None
+    short_version = plist_data.get("CFBundleShortVersionString")
+    current_version = short_version if isinstance(short_version, str) else None
+
+    url_scheme_ok = False
+    if channel_url is not None and channel_url.startswith(
+        ("https://", "http://")
+    ):
+        url_scheme_ok = bool(urlsplit(channel_url).hostname)
+
+    version_segments: list[int] | None = None
+    version_comparable = False
+    if current_version:
+        segments = current_version.split(".")
+        if all(
+            VERSION_SEGMENT_PATTERN.fullmatch(segment) for segment in segments
+        ):
+            version_segments = [int(segment) for segment in segments]
+            version_comparable = True
+
+    if channel_url is None:
+        status = "missing-config"
+    elif not url_scheme_ok:
+        status = "bad-url"
+    elif not version_comparable:
+        status = "bad-version"
+    else:
+        status = "ok"
+
+    return {
+        "channel_url": channel_url,
+        "current_version": current_version,
+        "url_scheme_ok": url_scheme_ok,
+        "version_comparable": version_comparable,
+        "version_segments": version_segments,
+        "status": status,
+    }
+
+
 def _collect_apps_diff(old_arg: str, new_arg: str) -> dict:
     """Compare two ``.app`` bundles using the app-info/macho-info rules."""
     # Validate and inspect the old bundle fully before touching the new one.
@@ -634,6 +713,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="target architecture label (i386, ppc, x86_64 or ppc64)",
     )
 
+    update_check_parser = subparsers.add_parser(
+        "update-check",
+        help="Statically check the update-channel configuration of a .app bundle.",
+    )
+    update_check_parser.add_argument("app", help="path to the .app bundle directory")
+
     args = parser.parse_args(argv)
 
     if args.command is None:
@@ -680,6 +765,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             report = _collect_dep_check(args.app, args.arch)
         except DepCheckError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps(report))
+        return 0
+
+    if args.command == "update-check":
+        try:
+            report = _collect_update_check(args.app)
+        except UpdateCheckError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
         print(json.dumps(report))
